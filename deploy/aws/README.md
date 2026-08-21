@@ -8,9 +8,16 @@ Upstream's `docker-compose.yaml` is used **unmodified**. Everything AWS-specific
 `docker-compose.aws.yaml`, applied as a Compose override, so this deployment can track
 upstream without maintaining a fork.
 
-> **Status:** Phases 1–3 done. Phase 4 (the waker) is not built yet, so nothing is
-> reachable from the internet — reach services over SSM port-forwarding for now. See
+> **Status:** Phases 1–3 done and verified on a real deployment — 31/31 acceptance checks
+> on a from-zero `create-stack`, plus a full stop/wake cycle. Phase 4 (the waker) is not
+> built, so nothing is reachable from the internet; use SSM port-forwarding. See
 > [NOTES.md](NOTES.md) for measurements and the friction log.
+>
+> **Read the capacity section before building Phase 4.** GPU capacity in `us-east-1` moved
+> constantly during testing, and a wake after idle shutdown failed on its first attempt
+> with `InsufficientInstanceCapacity` before succeeding on retry 51 seconds later. The
+> waker must retry, and `g5`/`g4dn` are worth evaluating — measured peak VRAM was 3.8 GB of
+> 22.4 GB available.
 
 ## Design
 
@@ -89,6 +96,24 @@ aws ssm start-session --target <instance-id> \
   --document-name AWS-StartPortForwardingSession \
   --parameters '{"portNumber":["80"],"localPortNumber":["8080"]}'
 ```
+
+## Verified behaviour
+
+From a clean `create-stack` on a `g6.2xlarge` in `us-east-1d`:
+
+| | |
+|---|---|
+| Image build | 23 m 21 s |
+| Stack create → serving | 25 m 40 s |
+| Root disk used after bootstrap | 110 GiB of 194 |
+| Acceptance checks | 31 / 31 |
+| Idle timer stopped the instance | yes, unattended |
+| Wake → all four services healthy | ~30 s after boot, no rebuild |
+| Maps survived stop/start | yes, checksum identical |
+
+The device name for the maps volume changed from `/dev/nvme2n1` to `/dev/nvme1n1` across
+that stop/start. It remounted correctly because `/etc/fstab` keys on UUID and the bootstrap
+identifies the disk by its NVMe serial. Never key on a device path here.
 
 ## Idle shutdown
 

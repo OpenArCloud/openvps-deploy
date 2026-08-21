@@ -712,3 +712,97 @@ weaker than it looks:
 Recommendation: accept and retry for now, and evaluate `g5`/`g4dn` before this goes in
 front of users. The measurements say the GPU is not the constraint, so trading down on GPU
 to buy availability is close to free in performance terms.
+
+### The predicted wake failure, observed — and what it actually cost
+
+This stopped being theoretical during Phase 3 verification. After the idle timer stopped
+the instance as designed, the first attempt to wake it returned:
+
+```
+06:45:35Z  attempt 1 -> InsufficientInstanceCapacity ... calling StartInstances
+06:46:26Z  attempt 2 -> pending
+RUNNING after 2 start attempt(s), 73s total
+```
+
+The instance had been running in that AZ minutes earlier; stopping it released the hardware
+and it was not immediately there to reclaim.
+
+**It recovered on the next attempt, 51 seconds later.** That matters — the failure is
+transient, not a hard block, and a waker that retries handles it. It is a latency problem,
+not an availability wall. Do not over-read a single observation in either direction: one
+retry sufficed here, and nothing about that guarantees one retry always will.
+
+What it does establish:
+
+- **The waker must retry `StartInstances`, not call it once.** A single call fails often
+  enough to be seen on the very first test. Phase 4's holding page must poll through
+  repeated capacity errors and stay honest with the user rather than spinning.
+- **The three-minute cold-request target is at risk, not out of reach.** 73 seconds of
+  start plus ~35 seconds of container start leaves room inside three minutes — but only if
+  the retry budget stays small. A run of failures would blow it.
+- **It reinforces, without proving, the case for another GPU family.** Measured peak VRAM
+  was 3.8 GB of 22.4 GB, so `g5` or `g4dn` would very likely run this workload with less
+  contention. Worth measuring before Phase 4, not assuming.
+
+### Wake behaviour, verified end to end
+
+| Check | Result |
+|---|---|
+| Instance stopped itself via the real timer | yes, ~06:39:34Z |
+| `StartInstances` | succeeded on retry 2, 73s total |
+| Maps volume remounted | by UUID, marker file md5 identical (`ae596130…`) |
+| `openvps.service` | `enabled` and `active` with no intervention |
+| All four services | healthy ~30s after boot |
+| `openvps_hloc_cache` volume | present |
+| Images rebuilt? | **no** — a wake skips the 25-minute build entirely |
+| Serving | frontend 200, `/maps` 401 |
+| Idle timer | re-armed, next run +10min (`OnBootSec`) |
+
+**The device name changed across the reboot: `/dev/nvme2n1` became `/dev/nvme1n1`.** The
+maps volume still mounted correctly because `/etc/fstab` keys on UUID and the bootstrap
+keys on the NVMe serial. Had either used a device path, the wake would have mounted the
+wrong disk or nothing at all. This is the clearest possible evidence for both choices, and
+it appeared on the very first stop/start cycle.
+
+---
+
+## Phase 4 — Waker: not built, and what Phase 3 says about it
+
+Out of scope for this session, but three findings above bear directly on it and should be
+read before it is designed.
+
+**1. FusionAuth has no home yet.** It is not in upstream's compose file, needs Postgres and
+Elasticsearch alongside it (~4 GB), and so cannot run on a `t4g.nano`. If it runs on the
+GPU host, login is unavailable exactly when a user first arrives and the host is still
+waking. Options, all with costs: a larger always-on waker (a standing charge needing
+sign-off), FusionAuth Cloud (likewise), or accepting that login only works once the GPU
+host is warm. This is the biggest unresolved design question in the project.
+
+**2. The upload path has one remaining limit, and it is Caddy's.** Upstream's 5 GB nginx
+cap is lifted by the override, and the backend streams through `connect-busboy` with no
+`limits` configured, so it imposes none. Caddy must not reintroduce one — and per the
+brief, it has to be tested with a real multi-GB upload, not a small `curl`. Note the
+override also sets `proxy_request_buffering off` and hour-long timeouts; Caddy needs
+matching treatment or a slow multi-GB upload will time out in the proxy instead.
+
+**3. The waker must retry `StartInstances` and degrade honestly.** Verified above: the
+first wake attempt failed on capacity and the second succeeded 51 seconds later. A single
+call is not enough. The holding page should poll through repeated capacity errors and, past
+some threshold, say plainly that GPU capacity is unavailable rather than spinning forever.
+The three-minute cold-request target holds only when the retry budget stays small.
+
+Everything the waker needs from Phase 2 is already exported by the stack:
+`WakerSecurityGroupId` (its security group, already the GPU host's only ingress source),
+`PrivateIp` (stable across stop/start — proxy to this, not to a public address), and
+`InstanceId` (for `StartInstances`).
+
+Ports on the GPU host, all reachable only from the waker's security group:
+
+| Service | Port |
+|---|---|
+| MapBuilder frontend | 80 |
+| MapAligner | 3001 |
+| MapLocalizer | 8000 |
+
+Port 443 on the frontend is bound to `127.0.0.1` and carries upstream's self-signed cert;
+ignore it. Caddy terminates TLS and speaks plain HTTP to port 80.
