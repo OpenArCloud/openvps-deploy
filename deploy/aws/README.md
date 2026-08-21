@@ -29,7 +29,7 @@ upstream without maintaining a fork.
        ├─ GPU instance stopped → holding page + StartInstances
        └─ GPU instance running → reverse proxy
                      │
-   g6.2xlarge "openvps"  started on demand
+   g4dn.2xlarge "openvps"  started on demand
      gp3 root 200 GB   Docker images + HLOC weights, survives stop
      gp3 data 200 GB   → /home/ubuntu/data/maps  (MY_SHARED_MAPS_DIR)
      docker compose up: backend, mapaligner, maplocalizer, frontend
@@ -151,15 +151,21 @@ On-demand, `us-east-1`, from Phase 1 measurements.
 
 | Component | Rate | Notes |
 |---|---|---|
-| `g6.2xlarge` GPU host | $0.9776/hr | only while awake |
-| `g6.xlarge` alternative | $0.8048/hr | 4 vCPU; see the sizing note in NOTES.md |
+| `g4dn.2xlarge` GPU host (default) | $0.7520/hr | only while awake; 8 vCPU, 32 GiB, T4 |
+| `g6.2xlarge` alternative | $0.9776/hr | faster GPU matching, but far scarcer capacity |
 | `t4g.nano` waker | $0.0042/hr | ~$3.07/mo, always on |
 | gp3 root, 200 GB | ~$16/mo | standing; survives instance stop |
 | gp3 data, 200 GB | ~$16/mo | standing; `DeletionPolicy: Retain` |
 | Elastic IP | ~$3.60/mo | standing while allocated |
 
 Standing cost is therefore about **$39/mo** with the GPU host stopped, plus roughly
-**$0.98 per awake hour**. At 2 h/day the GPU adds about $59/mo.
+**$0.75 per awake hour**. At 2 h/day the GPU adds about $46/mo.
+
+`g4dn.2xlarge` is the default on availability, not on speed: a capacity probe found it in
+5 of 5 `us-east-1` AZs against 1 of 5 for `g6.2xlarge`, at 23 % lower cost for identical
+vCPU, RAM, and reconstruction quality. Its T4 is ~76 % slower on the SuperGlue matching
+stage, which grows with scan size — if map build time matters more than availability,
+`g6.2xlarge` is one parameter away. See NOTES.md.
 
 The root volume is 200 GB because measurement demanded it, not by preference: the Deep
 Learning AMI occupies 50 GB before anything is built, steady state after building all four

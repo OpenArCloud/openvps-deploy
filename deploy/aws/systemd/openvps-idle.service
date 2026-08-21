@@ -1,0 +1,6 @@
+[Unit]
+Description=OpenVPS idle check
+After=openvps.service
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/openvps-idle-shutdown

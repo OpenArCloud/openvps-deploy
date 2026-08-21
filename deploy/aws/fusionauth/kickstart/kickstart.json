@@ -1,0 +1,117 @@
+{
+  "_comment": [
+    "Applied by FusionAuth only against an empty database, on first boot.",
+    "",
+    "Why this file exists: the OAuth client id and secret must agree in two places at once \u2014",
+    "inside FusionAuth, and in the docker.env the two OpenVPS apps read. Configuring",
+    "FusionAuth by hand and copying the generated values into Secrets Manager is a",
+    "chicken-and-egg dance that has to be repeated on every rebuild. Instead the values are",
+    "generated once into Secrets Manager, and this file tells FusionAuth to adopt them.",
+    "",
+    "#{ENV.X} is substituted by FusionAuth from the container environment, which user-data",
+    "populates from Secrets Manager. Nothing secret lives in this file or in git.",
+    "",
+    "Request order matters: kickstart executes them in sequence, so the application must",
+    "exist before anything can be registered to it.",
+    "",
+    "Redirect URLs must match the public app URLs EXACTLY or login fails with a",
+    "misconfiguration error \u2014 the most common way to break this deployment.",
+    "The tenant issuer is NOT set here. #{defaultTenantId} is not an implicit kickstart",
+    "variable \u2014 referencing it aborts the ENTIRE kickstart with 'You may not use an",
+    "undefined variable', leaving no api key and no application. It is set from the API",
+    "by openvps-fusionauth-configure once FusionAuth is up."
+  ],
+  "variables": {
+    "adminUserId": "#{UUID()}",
+    "fusionauthAdminAppId": "3c219e58-ed0e-4b18-ad48-f4f92793ae32"
+  },
+  "apiKeys": [
+    {
+      "key": "#{ENV.FUSIONAUTH_API_KEY}",
+      "description": "openvps-aws bootstrap key"
+    }
+  ],
+  "requests": [
+    {
+      "_comment": "1. The OpenVPS application, adopting the client id/secret from Secrets Manager.",
+      "method": "POST",
+      "url": "/api/application/#{ENV.AUTH_FUSIONAUTH_ID}",
+      "body": {
+        "application": {
+          "name": "OpenVPS",
+          "oauthConfiguration": {
+            "clientSecret": "#{ENV.AUTH_FUSIONAUTH_SECRET}",
+            "enabledGrants": [
+              "authorization_code",
+              "refresh_token"
+            ],
+            "generateRefreshTokens": true,
+            "requireRegistration": false,
+            "authorizedRedirectURLs": [
+              "#{ENV.MAPBUILDER_URL}/auth/callback/fusionauth",
+              "#{ENV.MAPALIGNER_URL}/api/auth/callback/fusionauth",
+              "http://localhost:8047/auth/callback/fusionauth",
+              "http://localhost:3001/api/auth/callback/fusionauth"
+            ],
+            "authorizedOriginURLs": [
+              "#{ENV.MAPBUILDER_URL}",
+              "#{ENV.MAPALIGNER_URL}",
+              "#{ENV.MAPLOCALIZER_URL}"
+            ],
+            "logoutURL": "#{ENV.MAPBUILDER_URL}"
+          },
+          "jwtConfiguration": {
+            "enabled": true,
+            "timeToLiveInSeconds": 3600,
+            "refreshTokenTimeToLiveInMinutes": 43200
+          },
+          "roles": [
+            {
+              "name": "admin",
+              "isDefault": false,
+              "isSuperRole": true
+            },
+            {
+              "name": "user",
+              "isDefault": true,
+              "isSuperRole": false
+            }
+          ]
+        }
+      }
+    },
+    {
+      "_comment": "2. Admin user, registered to FusionAuth's own admin app so the console is reachable.",
+      "method": "POST",
+      "url": "/api/user/registration/#{adminUserId}",
+      "body": {
+        "user": {
+          "email": "#{ENV.FUSIONAUTH_ADMIN_EMAIL}",
+          "password": "#{ENV.FUSIONAUTH_ADMIN_PASSWORD}",
+          "firstName": "OpenVPS",
+          "lastName": "Admin",
+          "skipVerification": true
+        },
+        "registration": {
+          "applicationId": "#{fusionauthAdminAppId}",
+          "roles": [
+            "admin"
+          ]
+        }
+      }
+    },
+    {
+      "_comment": "3. Same user registered to the OpenVPS application, so they can actually log in to it.",
+      "method": "POST",
+      "url": "/api/user/registration/#{adminUserId}",
+      "body": {
+        "registration": {
+          "applicationId": "#{ENV.AUTH_FUSIONAUTH_ID}",
+          "roles": [
+            "admin"
+          ]
+        }
+      }
+    }
+  ]
+}

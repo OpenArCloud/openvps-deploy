@@ -1,0 +1,101 @@
+# Copyright 2026 — OpenVPS AWS deployment
+# SPDX-License-Identifier: MIT
+#
+# FusionAuth, the identity provider the two OpenVPS web apps delegate login to.
+#
+# This is a SEPARATE compose project from upstream's, deliberately. Upstream's
+# docker-compose.yaml defines four services and no identity provider; OpenVPS assumes an
+# external OIDC issuer and pins FusionAuth's endpoint layout. Keeping this stack separate is
+# what lets upstream stay untouched.
+#
+#   docker compose -p openvps-auth -f docker-compose.fusionauth.yaml \
+#                  --env-file /opt/openvps/fusionauth.env up -d
+#
+# Two departures from FusionAuth's stock compose, both deliberate:
+#
+#   1. No search container. FusionAuth's own docs make Elasticsearch/OpenSearch optional and
+#      document removing it once FUSIONAUTH_SEARCH_TYPE=database. That takes the stack from
+#      ~4 GB to ~2 GB and removes a container whose healthcheck is a known failure point.
+#   2. Postgres data lives on the RETAINED data volume, not a docker volume on the root
+#      disk. The database holds every user account plus the OAuth client secret the apps
+#      authenticate with — lose it and nobody can log in and the apps' credentials are
+#      stale. It has to survive stack deletion exactly as the maps do.
+
+name: openvps-auth
+
+services:
+  db:
+    image: postgres:16.9-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: fusionauth
+      # Postgres refuses to initialise into a non-empty directory such as a fresh ext4
+      # mount containing lost+found, so keep the cluster in a subdirectory.
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - ${FUSIONAUTH_DB_DIR}:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d fusionauth"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    restart: unless-stopped
+    logging: &logging
+      driver: json-file
+      options: {max-size: "20m", max-file: "3"}
+
+  fusionauth:
+    image: fusionauth/fusionauth-app:1.69.0
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: jdbc:postgresql://db:5432/fusionauth
+      DATABASE_ROOT_USERNAME: ${POSTGRES_USER}
+      DATABASE_ROOT_PASSWORD: ${POSTGRES_PASSWORD}
+      DATABASE_USERNAME: ${POSTGRES_USER}
+      DATABASE_PASSWORD: ${POSTGRES_PASSWORD}
+      # Database-backed search: no Elasticsearch, no OpenSearch, no extra container.
+      FUSIONAUTH_APP_SEARCH_ENGINE_TYPE: database
+      FUSIONAUTH_APP_MEMORY: 512M
+      FUSIONAUTH_APP_RUNTIME_MODE: production
+      # FusionAuth's own address for internal use — cache-reload notifications it sends to
+      # itself. It must be a URL the container can actually reach, NOT the public issuer.
+      # Pointing it at the public hostname makes every cache reload fail
+      # ("Failed to request a cache reload for [Instance]"), which leaves the OIDC discovery
+      # document serving a stale issuer even after the tenant has been updated correctly.
+      # The PUBLIC identity is the tenant issuer, set separately by
+      # openvps-fusionauth-configure — a different concept from this.
+      FUSIONAUTH_APP_URL: http://fusionauth:9011
+      SEARCH_TYPE: database
+      # Applied only against an empty database. Makes tenant, application, client id and
+      # client secret reproducible instead of hand-configured — which matters because those
+      # values must agree with what the apps read from Secrets Manager.
+      FUSIONAUTH_APP_KICKSTART_FILE: /usr/local/fusionauth/kickstart/kickstart.json
+      # Consumed by kickstart.json as #{ENV.X}. Populated from Secrets Manager at boot;
+      # never written to git.
+      AUTH_FUSIONAUTH_ID: ${AUTH_FUSIONAUTH_ID}
+      AUTH_FUSIONAUTH_SECRET: ${AUTH_FUSIONAUTH_SECRET}
+      FUSIONAUTH_API_KEY: ${FUSIONAUTH_API_KEY}
+      FUSIONAUTH_ADMIN_EMAIL: ${FUSIONAUTH_ADMIN_EMAIL}
+      FUSIONAUTH_ADMIN_PASSWORD: ${FUSIONAUTH_ADMIN_PASSWORD}
+      FUSIONAUTH_ISSUER: ${FUSIONAUTH_ISSUER}
+      MAPBUILDER_URL: ${MAPBUILDER_URL}
+      MAPALIGNER_URL: ${MAPALIGNER_URL}
+      MAPLOCALIZER_URL: ${MAPLOCALIZER_URL}
+    volumes:
+      - /opt/openvps/fusionauth/kickstart:/usr/local/fusionauth/kickstart:ro
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "--output", "/dev/null", "http://127.0.0.1:9011/api/status"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 90s
+    ports:
+      # Reachable only from the waker's security group; Caddy terminates TLS and proxies
+      # auth.<domain> here.
+      - "9011:9011"
+    restart: unless-stopped
+    logging: *logging

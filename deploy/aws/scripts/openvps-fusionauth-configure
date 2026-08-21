@@ -1,0 +1,89 @@
+#!/bin/bash
+# Copyright 2026 — OpenVPS AWS deployment
+# SPDX-License-Identifier: MIT
+#
+# Sets the FusionAuth tenant issuer to the public URL, after FusionAuth is up.
+#
+# This is deliberately NOT done in kickstart.json. Kickstart has no implicit
+# #{defaultTenantId} variable, and referencing one aborts the entire kickstart with
+# "You may not use an undefined variable" — which fails silently from the outside: the
+# container is healthy, but no API key and no application were ever created. Declaring the
+# variable as #{UUID()} is no better, since that invents a new tenant id rather than
+# addressing the default tenant FusionAuth just created.
+#
+# Doing it from the API has a second advantage: kickstart only ever runs against an empty
+# database, whereas this runs on every start, so changing DomainName later actually takes
+# effect instead of silently leaving a stale issuer behind.
+#
+# Why the issuer matters: it is the `iss` claim of every JWT FusionAuth issues, and it is
+# what the OIDC discovery document advertises. Auth.js validates `iss` against the issuer it
+# was configured with. Left at FusionAuth's default of https://example.com, a user types a
+# correct password, gets redirected back, and login fails at token validation — presenting
+# as an opaque callback error rather than a configuration mistake.
+
+set -uo pipefail
+
+ENV_FILE=/opt/openvps/fusionauth.env
+[ -r "$ENV_FILE" ] || { echo "no $ENV_FILE"; exit 1; }
+# shellcheck disable=SC1090
+. "$ENV_FILE"
+
+: "${FUSIONAUTH_API_KEY:?}"
+: "${FUSIONAUTH_ISSUER:?}"
+BASE=http://127.0.0.1:9011
+
+log() { logger -t openvps-fa-config -- "$*"; echo "$*"; }
+
+# FusionAuth reports healthy before its API is reliably serving; poll.
+for _ in $(seq 1 60); do
+  curl -sf -o /dev/null "$BASE/api/status" && break
+  sleep 5
+done
+curl -sf -o /dev/null "$BASE/api/status" || { log "FusionAuth API never came up"; exit 1; }
+
+tenants=$(curl -sf -H "Authorization: $FUSIONAUTH_API_KEY" "$BASE/api/tenant") || {
+  log "could not list tenants — is the kickstart API key present?"; exit 1; }
+
+read -r TENANT_ID CURRENT <<<"$(printf '%s' "$tenants" | python3 -c '
+import json, sys
+ts = json.load(sys.stdin).get("tenants", [])
+if not ts:
+    sys.exit(1)
+# A stock install has exactly one tenant; prefer the one named Default if that changes.
+t = next((x for x in ts if x.get("name") == "Default"), ts[0])
+print(t["id"], t.get("issuer", ""))
+')" || { log "could not parse tenant list"; exit 1; }
+
+if [ "$CURRENT" = "$FUSIONAUTH_ISSUER" ]; then
+  log "tenant $TENANT_ID issuer already $FUSIONAUTH_ISSUER"
+  exit 0
+fi
+
+log "setting tenant $TENANT_ID issuer: '$CURRENT' -> '$FUSIONAUTH_ISSUER'"
+code=$(curl -s -o /tmp/fa-patch.out -w '%{http_code}' -X PATCH \
+  -H "Authorization: $FUSIONAUTH_API_KEY" -H 'Content-Type: application/json' \
+  -d "{\"tenant\":{\"issuer\":\"$FUSIONAUTH_ISSUER\"}}" \
+  "$BASE/api/tenant/$TENANT_ID")
+
+if [ "$code" != "200" ]; then
+  log "PATCH failed with HTTP $code: $(head -c 300 /tmp/fa-patch.out)"
+  rm -f /tmp/fa-patch.out
+  exit 1
+fi
+rm -f /tmp/fa-patch.out
+
+# Confirm the change actually reached the discovery document, since that is what clients
+# read. The document is cached briefly, so this polls rather than checking once — an
+# immediate read reliably still shows the old issuer and produced a spurious failure.
+got=""
+for _ in $(seq 1 24); do
+  got=$(curl -sf "$BASE/.well-known/openid-configuration" \
+        | python3 -c 'import json,sys; print(json.load(sys.stdin).get("issuer",""))' 2>/dev/null)
+  [ "$got" = "$FUSIONAUTH_ISSUER" ] && break
+  sleep 5
+done
+if [ "$got" != "$FUSIONAUTH_ISSUER" ]; then
+  log "issuer still advertised as '$got' after PATCH and 120s of polling"
+  exit 1
+fi
+log "issuer confirmed in discovery document: $got"

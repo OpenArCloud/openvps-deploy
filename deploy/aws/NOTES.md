@@ -838,3 +838,333 @@ Also worth noting: the maps volume was observed surviving `delete-stack` twice �
 `available` after a failed stack, and once as `MapsVolume DELETE_SKIPPED` in the events of
 a clean deletion. Retention works, and it means teardown leaves a billing tail unless the
 volume is deleted deliberately.
+
+---
+
+## GPU family evaluation — `g4dn` vs `g5` vs `g6`
+
+Prompted by the wake failure. The question was whether a different family fixes availability
+without costing too much performance. Answered by measurement: a capacity probe across all
+five `us-east-1` AZs, then a full stack deployed on `g4dn.2xlarge` running the identical
+Phase 1 benchmark.
+
+### Availability and price
+
+Real launch-and-terminate probes, all within a few minutes on 2026-08-21:
+
+| Type | AZs with capacity | $/hr | vCPU | RAM | GPU | VRAM |
+|---|---|---|---|---|---|---|
+| `g6.2xlarge` | **1 of 5** (`1d`) | $0.978 | 8 | 32 GiB | L4 | 22.4 GiB |
+| `g5.2xlarge` | 3 of 5 | $1.212 | 8 | 32 GiB | A10G | 22.4 GiB |
+| **`g4dn.2xlarge`** | **5 of 5** | **$0.752** | 8 | 32 GiB | T4 | 15 GiB |
+
+`g5` is the worst of the three — more expensive than `g6` and not universally available.
+`g4dn.2xlarge` is available everywhere, 23 % cheaper than `g6.2xlarge`, with identical vCPU
+and RAM.
+
+### The stack runs unmodified on T4
+
+`create-stack` with `InstanceType=g4dn.2xlarge` reached `CREATE_COMPLETE` with no template
+changes beyond widening `AllowedValues`. Build 24 m 35 s (vs 23 m 21 s on `g6.2xlarge`,
+~5 % slower). Root disk 111 GiB — identical. All four services healthy, `torch 2.4.1+cu121`
+on `Tesla T4` in both GPU containers. The volume detector correctly skipped this family's
+209 GB instance store, which the DLAMI again pre-formats as LVM at `/opt/dlami/nvme`.
+
+### Benchmark: the same `sacre_coeur` reconstruction
+
+| | `g6.xlarge` (L4, 4 vCPU) | `g4dn.2xlarge` (T4, 8 vCPU) |
+|---|---|---|
+| Total, cold (incl. NetVLAD download) | 39.4 s | 39.6 s |
+| Total, warm | not measured | 21.8 s |
+| Registered images | 10 / 10 | 10 / 10 |
+| 3D points | 1786 | 1791–1793 |
+| Mean reprojection error | 0.985 px | 0.985 px |
+| Peak VRAM allocated | 1353.9 MB | 1353.9 MB |
+| Peak VRAM reserved | 3556 MB | 3270 MB |
+| Peak host RAM | 2849 MB | 2812 MB |
+| Model-load VRAM, native res | 6044 MB | 6044 MB |
+
+Reconstruction quality is identical to three decimal places. VRAM behaviour is identical,
+and 6 GB at native resolution fits T4's 15 GiB with room to spare.
+
+**Caveat on the comparison — it is not perfectly controlled.** The L4 run was on a 4-vCPU
+`g6.xlarge`; the T4 run was on an 8-vCPU `g4dn.2xlarge`. Total wall time landing within
+0.2 s of each other therefore reflects both the slower GPU and the extra CPU, not the GPU
+alone.
+
+### Where the T4 actually loses, and why it may matter
+
+Per-stage, warm, on T4 — compared against the L4 stages captured in Phase 1:
+
+| Stage | L4 | T4 | Note |
+|---|---|---|---|
+| `superpoint-extract` | 0.4 s | 0.5 s | negligible |
+| `superglue-match` | 3.7 s | **6.5 s** | **~76 % slower — the GPU-bound stage** |
+| `colmap-reconstruction` | 3.8 s | 4.9 s | CPU-bound |
+| `netvlad-retrieval-extract` | not captured | 9.6 s | — |
+
+SuperGlue matching is where the older GPU shows. On 10 images that is 6.5 s of a 21.8 s run
+and irrelevant. **On a real scan it will not be irrelevant:** retrieval-based matching scales
+with pairs (roughly `n × k`), so a 500-frame scan does ~50× the matching of this test, and a
+76 % penalty on the dominant stage becomes real minutes.
+
+### Recommendation
+
+**Default to `g4dn.2xlarge`, keep `g6.2xlarge` as a parameter.** A service that cannot start
+is worse than one that builds maps more slowly, and 5-of-5 availability against 1-of-5 is
+the difference between a waker that works and one that intermittently does not. It is also
+23 % cheaper for identical CPU, RAM, and reconstruction quality.
+
+The honest counter-argument: nobody has yet measured a real multi-hundred-frame scan on
+either GPU, and that is exactly where the T4's matching penalty concentrates. If map build
+time turns out to matter more than availability, `g6.2xlarge` is one parameter away — but
+that AZ must then be probed for `g6` capacity first, and pinned before the maps volume
+exists.
+
+---
+
+## FusionAuth: where it should live
+
+An earlier note in this file called this "the biggest unresolved design question" and said
+FusionAuth needs ~4 GB with Postgres *and* Elasticsearch, so it cannot sit on a `t4g.nano`
+and would be offline whenever the GPU host is stopped. **Two thirds of that was wrong**, and
+the correction changes the answer.
+
+### Correction 1 — Elasticsearch is optional
+
+FusionAuth's own system requirements state Elasticsearch is optional, with a database-backed
+search engine as the alternative, selected by `FUSIONAUTH_SEARCH_TYPE=database`. Their
+docker-compose ships an OpenSearch container, and the documentation explicitly says it can
+be removed once the search type is changed. The ~4 GB figure came from reading OpenVPS's
+`docs/FusionAuth.md`, which just points at that stock compose file.
+
+Actual requirements without a search engine:
+
+| Component | RAM |
+|---|---|
+| FusionAuth | 512 MB minimum, 1 GB recommended |
+| PostgreSQL | 1–2 GB for light usage |
+| **Total** | **~2–3 GB** |
+
+### Correction 2 — "offline while the GPU is stopped" barely matters
+
+The concern was that a user arriving at a cold system could not log in. Trace the actual
+flow: the user hits the waker, gets the holding page, the waker calls `StartInstances`, the
+GPU host boots, and only *then* does the waker proxy them to MapBuilder — which is the point
+at which MapBuilder redirects to the FusionAuth issuer. By then FusionAuth is up. The user
+cannot log in while the host is stopped, but they cannot do anything else either, and the
+holding page already covers that window.
+
+The brief's own architecture diagram put `fusionauth` and `postgres` on the GPU instance.
+That was right; the objection was not.
+
+### Options, with real numbers
+
+| Option | Standing cost | Notes |
+|---|---|---|
+| **On the GPU host** | **$0** | 2–3 GB on a 32 GiB box is nothing. Down when the host is down, which does not matter. |
+| `t4g.small` always-on | $12.26/mo | 2 GB — tight for FusionAuth + Postgres together |
+| `t4g.medium` always-on | $24.53/mo | 4 GB — comfortable. Auth stays up independent of the GPU. |
+| FusionAuth Cloud | from **$75/mo** | Lowest tier. Poor value at this scale. |
+| AWS Cognito | ~$0 (free tier 10k MAU) | **Does not drop in** — see below |
+
+### Why Cognito does not simply drop in
+
+Tempting, because it is managed and effectively free. But upstream pins the identity
+provider harder than it first appears. Both services use the Auth.js FusionAuth provider and
+derive every endpoint from `AUTH_FUSIONAUTH_ISSUER`:
+
+```js
+userinfo:      issuer + "/oauth2/userinfo"
+authorization: issuer + "/oauth2/authorize"
+token:         issuer + "/oauth2/token"
+params: { scope: "offline_access openid profile email" }
+```
+
+Cognito is close but not equal:
+
+- Its user-attributes endpoint is `/oauth2/userInfo` — **capital I**. Upstream sends
+  lowercase.
+- Upstream hardcodes `offline_access` in the requested scope. Cognito's system-reserved
+  scopes are `openid`, `email`, `phone`, `profile` and `aws.cognito.signin.user.admin`;
+  requesting a scope not associated with the app client fails authentication. Whether
+  `offline_access` can be made to work on Cognito is genuinely unclear from the
+  documentation and would need testing.
+
+Both could in principle be papered over in Caddy — rewrite the path case, strip the scope —
+but that is a fragile proxy hack sitting in the authentication path, to save money that a
+`t4g.medium` would cost anyway. Not recommended without testing that actually settles the
+scope question.
+
+### Recommendation
+
+**Run FusionAuth on the GPU host**, as a second compose file alongside (never inside)
+upstream's, with `FUSIONAUTH_SEARCH_TYPE=database` and no search container. Cost: nothing.
+
+Three things that need care:
+
+1. **Postgres data must outlive the instance.** Put it on the retained data volume, not the
+   root volume and not an anonymous docker volume. That means changing the data volume's
+   mount point from `/home/ubuntu/data/maps` to `/home/ubuntu/data`, keeping
+   `MY_SHARED_MAPS_DIR=/home/ubuntu/data/maps` as a subdirectory, and giving FusionAuth's
+   Postgres `/home/ubuntu/data/fusionauth-db`. User accounts then survive stack deletion
+   exactly as maps do.
+2. **Cold start grows.** FusionAuth plus a Postgres first-run migration adds perhaps 30–60 s
+   on top of the ~110 s already measured for wake plus container start. That eats into the
+   three-minute target and should be measured, not assumed.
+3. **The issuer URL is load-bearing.** `AUTH_FUSIONAUTH_ISSUER` must be the public
+   `https://auth.<domain>`, and FusionAuth's configured redirect URLs must match the public
+   MapBuilder and MapAligner URLs exactly, or login fails with a misconfiguration error.
+   Kickstart JSON can pin this configuration reproducibly rather than by hand.
+
+Choose the `t4g.medium` instead only if auth needs to be available independently of the GPU
+host — for example if other OARC services should share the same identity provider. That is
+a product decision, not a technical one.
+
+---
+
+## FusionAuth on the GPU host — implementation
+
+Decided per the analysis above. FusionAuth 1.69.0 and PostgreSQL 16.9 run as their own
+compose project (`openvps-auth`), never inside upstream's file.
+
+### Kickstart is what makes this reproducible
+
+The client id and secret must agree in two places at once: inside FusionAuth, and in the
+`docker.env` the apps read. The usual sequence — configure FusionAuth by hand, let it
+generate a client secret, copy that into Secrets Manager — has to be repeated on every
+rebuild and is the sort of manual step that silently rots.
+
+`kickstart/kickstart.json` inverts it. The values are generated once *into* Secrets Manager,
+and kickstart tells FusionAuth to adopt them:
+
+```
+POST /api/application/#{ENV.AUTH_FUSIONAUTH_ID}
+  oauthConfiguration.clientSecret = #{ENV.AUTH_FUSIONAUTH_SECRET}
+  authorizedRedirectURLs = [ #{ENV.MAPBUILDER_URL}/auth/callback/fusionauth, ... ]
+```
+
+Kickstart applies only against an empty database, so it configures a fresh deployment and
+never fights an existing one. It also pins the redirect URLs, which upstream's own docs call
+out as the thing that must match exactly or login fails with a misconfiguration error.
+Request order matters — the application must exist before a user can be registered to it.
+
+No search container: `FUSIONAUTH_SEARCH_TYPE=database`, per FusionAuth's documented option.
+
+### Postgres data lives on the retained volume
+
+The data volume now mounts at `/home/ubuntu/data` rather than directly at the maps
+directory, with `maps/` and `fusionauth-db/` as siblings. That database holds every user
+account **and** the OAuth client secret the apps authenticate with — losing it does not just
+lose logins, it strands the credentials the apps are configured with. It has to survive
+stack deletion exactly as the maps do, so it belongs on the `Retain`ed volume rather than
+the root disk or an anonymous docker volume.
+
+Ordering: `openvps.service` is `After=openvps-auth.service`, so the apps never start against
+a dead issuer. The idle detector counts port 9011 and the FusionAuth container as activity —
+a login in flight must not be shut down under — and on shutdown stops the apps before the
+database, so Postgres closes cleanly rather than being killed mid-transaction.
+
+## User-data hit its 16 KB ceiling, so config moved into stack Metadata
+
+Adding FusionAuth pushed user-data to 16,465 bytes against a hard 16,384 limit, with roughly
+8 KB of FusionAuth files still to add. Inlining everything had simply run out of room.
+
+Config files, scripts and unit files now travel in the **Instance resource's `Metadata`**,
+which rides in the template (51,200-byte limit) rather than in user-data. At boot, user-data
+reads them back with `describe-stack-resource` and writes them to disk.
+
+| | before | after |
+|---|---|---|
+| user-data | 16,465 / 16,384 — over | **8,441 / 16,384** |
+| template | 34,510 / 51,200 | **40,422 / 51,200** |
+
+Payloads are gzipped and base64'd. Plain text worked but left 263 bytes of template
+headroom, which the Phase 4 Caddyfile would have erased immediately. Base64 also contains
+nothing YAML or JSON must escape, so the whole class of block-scalar indentation bugs
+disappears.
+
+Two useful side effects: the payloads need no `Fn::Sub` escaping at all — no more `${!VAR}`
+— and they are byte-identical to the annotated copies under `deploy/aws/`, comments and all,
+instead of stripped-down duplicates.
+
+### The build step, and why it is a real tradeoff
+
+`template.yaml` is now **generated** by `build.py` from `template.src.yaml` plus the files
+it ships. `build.py --check` fails if the generated file is stale, which is the CI hook.
+
+This exists to kill duplication: without it the same payloads live twice — once readably in
+`deploy/aws/`, once pasted into the template — free to drift apart with nothing to catch it.
+
+The cost is honest and worth stating: `template.yaml` is no longer hand-editable. Anyone who
+edits it directly loses their change on the next build. The header says so, and `--check`
+catches it in CI, but it is a real papercut.
+
+**The alternative, if that tradeoff is unwelcome:** publish this repository and have
+user-data `git clone` it at boot, exactly as it already clones upstream and HLOC. That
+removes the size pressure and the duplication in one move, with no build step. It was not
+done here only because the repo is not published yet. Worth revisiting before Phase 4 adds
+the Caddyfile.
+
+### Verified: 30/30 on a deployed stack
+
+Files delivered from Metadata with correct modes, Postgres and FusionAuth healthy on the
+retained volume, kickstart applied, and the issuer correct:
+
+```
+name        : OpenVPS
+clientId    : <the value from Secrets Manager, adopted by FusionAuth>
+redirectURLs: https://build.vps.cloudpose.io/auth/callback/fusionauth
+              https://align.vps.cloudpose.io/api/auth/callback/fusionauth
+grants      : ['authorization_code', 'refresh_token']
+issuer      : https://auth.vps.cloudpose.io
+```
+
+A clean start of the auth stack from an empty database takes **23 s** through systemd —
+better than the 30–60 s estimated, so the effect on the three-minute cold-request target is
+smaller than feared.
+
+### Four bugs this exposed, three of them silent
+
+**1. Postgres cannot create its data directory in a root-owned mount.** The host directory
+was created `root:root` mode 700; the alpine Postgres image runs as uid 70. The container
+entered a restart loop logging `mkdir: can't create directory '/var/lib/postgresql/data/pgdata':
+Permission denied`. Fixing the ownership afterwards is not enough on its own — a half-made
+`pgdata` is left behind and has to be removed before initdb will run. The directory must be
+owned by uid 70 *before* the container first starts.
+
+**2. The stack reported CREATE_COMPLETE with the identity provider dead.** This is the worst
+of the four. `openvps.service` only `Wants` `openvps-auth.service`, so a broken FusionAuth
+does not stop the apps, and user-data only started the apps. The wait condition got its
+success signal while login was completely non-functional. A false green is worse than a
+failure: nothing looks wrong until someone tries to log in. User-data now starts the auth
+unit explicitly, dumps compose state and both containers' logs on failure, and fails the
+stack.
+
+**3. Kickstart aborts entirely on an undefined variable.** `#{defaultTenantId}` is not
+implicitly available. Referencing it produced one log line —
+`You may not use an undefined variable` — and **no** API key, **no** application, nothing.
+Everything downstream then failed in ways that pointed elsewhere: the API key was missing,
+so tenant queries returned non-JSON, which looked like a FusionAuth problem rather than a
+kickstart syntax problem. Kickstart is all-or-nothing; check its log line on first boot.
+
+**4. `FUSIONAUTH_APP_URL` is an internal address, not the public issuer.** Setting it to the
+public hostname made every internal cache-reload notification fail
+(`Failed to request a cache reload for [Instance]`), which left the OIDC discovery document
+serving a stale issuer even though the tenant record was correct. Two different concepts
+that both look like "the URL of this FusionAuth": the tenant *issuer* is the public
+identity that goes into JWTs and discovery; `FUSIONAUTH_APP_URL` is how the node reaches
+itself. Only the first should ever be public.
+
+And one false alarm worth recording: the discovery document is cached for a few seconds
+after a tenant PATCH, so verifying the issuer immediately reports the old value. The check
+now polls for up to 120 s. The verification itself earned its place — it is what caught
+bug 4.
+
+### Why the issuer is set from the API rather than kickstart
+
+Kickstart only runs against an empty database. Setting the issuer there would mean a later
+change to `DomainName` silently leaves a stale issuer in place, with login failing at token
+validation for reasons nothing surfaces. `openvps-fusionauth-configure` runs as
+`ExecStartPost` on every start, is idempotent, and verifies the result, so the issuer tracks
+the stack parameter.

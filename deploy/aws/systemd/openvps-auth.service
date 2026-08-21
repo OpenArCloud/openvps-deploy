@@ -1,0 +1,18 @@
+[Unit]
+Description=OpenVPS identity provider (FusionAuth + Postgres)
+Requires=docker.service
+After=docker.service network-online.target home-ubuntu-data.mount
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/openvps/fusionauth
+ExecStartPre=/usr/local/bin/openvps-render-env
+ExecStart=/usr/bin/docker compose -p openvps-auth -f docker-compose.fusionauth.yaml --env-file /opt/openvps/fusionauth.env up -d --wait --wait-timeout 600
+ExecStartPost=/usr/local/bin/openvps-fusionauth-configure
+ExecStop=/usr/bin/docker compose -p openvps-auth -f docker-compose.fusionauth.yaml --env-file /opt/openvps/fusionauth.env stop
+TimeoutStartSec=900
+
+[Install]
+WantedBy=multi-user.target

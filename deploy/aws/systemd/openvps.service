@@ -1,0 +1,18 @@
+[Unit]
+Description=OpenVPS compose stack
+Requires=docker.service
+# After the identity provider: the apps should not start against a dead issuer.
+After=docker.service network-online.target home-ubuntu-data.mount openvps-auth.service
+Wants=network-online.target openvps-auth.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/openvps/openvps
+ExecStartPre=/usr/local/bin/openvps-render-env
+ExecStart=/usr/bin/docker compose -f docker-compose.yaml -f /opt/openvps/docker-compose.aws.yaml --env-file /opt/openvps/docker.env up -d --wait --wait-timeout 600
+ExecStop=/usr/bin/docker compose -f docker-compose.yaml -f /opt/openvps/docker-compose.aws.yaml --env-file /opt/openvps/docker.env stop
+TimeoutStartSec=900
+
+[Install]
+WantedBy=multi-user.target

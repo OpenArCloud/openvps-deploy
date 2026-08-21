@@ -16,7 +16,8 @@
 #
 #   1. No CUDA compute process is running. This is the authoritative signal that no map is
 #      being built and no localization is in flight.
-#   2. No established TCP connection to a published service port from off-box.
+#   2. No established TCP connection to a published service port from off-box,
+#      including FusionAuth on 9011 — a login in flight is activity.
 #   3. No non-loopback request in any service's access log within the window.
 #   4. No backend job directory has been written recently.
 #
@@ -66,7 +67,7 @@ gpu_procs="$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/nu
 if [ -z "$reason" ]; then
   conns=$(ss -Htn state established 2>/dev/null \
           | awk '{print $3, $4}' \
-          | grep -E ':(80|3001|8000)\s' \
+          | grep -E ':(80|3001|8000|9011)\s' \
           | grep -vc '127\.0\.0\.1' || true)
   conns=${conns:-0}
   [ "$conns" -gt 0 ] && reason="conns:${conns}"
@@ -76,7 +77,7 @@ fi
 # `docker logs --since` is used rather than reading files, so this works regardless of
 # where each image sends its log.
 if [ -z "$reason" ]; then
-  for c in openvps-frontend-1 openvps-mapaligner-1 openvps-maplocalizer-1; do
+  for c in openvps-frontend-1 openvps-mapaligner-1 openvps-maplocalizer-1 openvps-auth-fusionauth-1; do
     docker inspect "$c" >/dev/null 2>&1 || continue
     hits=$(docker logs --since "${IDLE_MINUTES}m" "$c" 2>&1 \
            | grep -v '127\.0\.0\.1' \
@@ -108,8 +109,10 @@ if [ "$idle_for" -lt "$IDLE_MINUTES" ]; then
 fi
 
 log "idle ${idle_for}m >= ${IDLE_MINUTES}m; stopping compose and shutting down"
-# Stop compose first so containers exit cleanly and any in-flight write to the maps volume
-# is flushed before the filesystem goes away.
+# Stop the apps first, then the identity provider — Postgres last, so it shuts down cleanly
+# rather than being killed under an open transaction. Then sync, so any in-flight write to
+# the maps volume is flushed before the filesystem goes away.
 systemctl stop openvps.service || true
+systemctl stop openvps-auth.service || true
 sync
 shutdown -h now "openvps: idle for ${idle_for} minutes"

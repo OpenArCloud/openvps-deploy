@@ -1,0 +1,67 @@
+#!/bin/bash
+# Fetches secrets and writes docker.env. Never logs the values.
+set -uo pipefail
+BASE=/opt/openvps
+. ${BASE}/bootstrap.conf
+SECRET_JSON="$(aws secretsmanager get-secret-value --region "$REGION" \
+                --secret-id "$SECRET_ARN" --query SecretString --output text)" || {
+  echo "could not read secret $SECRET_ARN"; exit 1; }
+get() { printf '%s' "$SECRET_JSON" | python3 -c "import json,sys;print(json.load(sys.stdin).get('$1',''))"; }
+
+if [ -n "$DOMAIN" ]; then
+  SCHEME=https
+  BUILDER="$SCHEME://build.$DOMAIN"
+  ALIGNER="$SCHEME://align.$DOMAIN"
+  LOCALIZER="$SCHEME://vps.$DOMAIN"
+  ISSUER_DEFAULT="$SCHEME://auth.$DOMAIN"
+else
+  BUILDER="http://localhost"; ALIGNER="http://localhost:3001"
+  LOCALIZER="http://localhost:8000"; ISSUER_DEFAULT="http://localhost:9011"
+fi
+ISSUER="$(get AUTH_FUSIONAUTH_ISSUER)"; [ -n "$ISSUER" ] || ISSUER="$ISSUER_DEFAULT"
+
+umask 077
+cat > ${BASE}/docker.env <<ENVEOF
+MY_HTTP_PROXY=
+MY_HTTPS_PROXY=
+MY_USER_ID=1000
+MY_GROUP_ID=1000
+DEFAULT_LONGITUDE=$DEF_LON
+DEFAULT_LATITUDE=$DEF_LAT
+DEFAULT_HEIGHT=0
+MY_SHARED_MAPS_DIR=/home/ubuntu/data/maps
+AUTH_FUSIONAUTH_ID=$(get AUTH_FUSIONAUTH_ID)
+AUTH_FUSIONAUTH_SECRET=$(get AUTH_FUSIONAUTH_SECRET)
+AUTH_FUSIONAUTH_ISSUER=$ISSUER
+AUTH_SECRET=$(get AUTH_SECRET)
+MAPBUILDER_PORT=80
+MAPBUILDER_PORT_HTTPS=127.0.0.1:8443
+MAPBUILDER_URL=$BUILDER
+MAPALIGNER_PORT=3001
+MAPALIGNER_URL=$ALIGNER
+MAPLOCALIZER_PORT=8000
+MAPLOCALIZER_URL=$LOCALIZER
+ENVEOF
+chmod 600 ${BASE}/docker.env
+echo "docker.env rendered ($(wc -l < ${BASE}/docker.env) lines)"
+
+# FusionAuth's own stack. Same secret, different consumers: these values configure
+# the identity provider, while docker.env above tells the apps how to reach it.
+# The two MUST agree on client id and secret — kickstart.json is what guarantees
+# that, by making FusionAuth adopt the values rather than generate its own.
+cat > ${BASE}/fusionauth.env <<FAEOF
+POSTGRES_USER=fusionauth
+POSTGRES_PASSWORD=$(get FUSIONAUTH_DB_PASSWORD)
+FUSIONAUTH_DB_DIR=/home/ubuntu/data/fusionauth-db
+AUTH_FUSIONAUTH_ID=$(get AUTH_FUSIONAUTH_ID)
+AUTH_FUSIONAUTH_SECRET=$(get AUTH_FUSIONAUTH_SECRET)
+FUSIONAUTH_API_KEY=$(get FUSIONAUTH_API_KEY)
+FUSIONAUTH_ADMIN_EMAIL=$(get FUSIONAUTH_ADMIN_EMAIL)
+FUSIONAUTH_ADMIN_PASSWORD=$(get FUSIONAUTH_ADMIN_PASSWORD)
+FUSIONAUTH_ISSUER=$ISSUER
+MAPBUILDER_URL=$BUILDER
+MAPALIGNER_URL=$ALIGNER
+MAPLOCALIZER_URL=$LOCALIZER
+FAEOF
+chmod 600 ${BASE}/fusionauth.env
+echo "fusionauth.env rendered ($(wc -l < ${BASE}/fusionauth.env) lines)"
