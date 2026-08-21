@@ -147,4 +147,208 @@ Choice and rationale recorded in Phase 1. Requires `git submodule update --init 
 
 ## Phase 1 — Manual bring-up
 
-_In progress._
+Date: 2026-08-21. Instance `g6.xlarge` in `us-east-1c`, AMI
+`ami-0909175f265dac51e` (Deep Learning Base OSS Nvidia Driver GPU, Ubuntu 22.04, 20260818),
+250 GB encrypted gp3 root (deliberately oversized so real consumption could be measured),
+no key pair, no inbound rules, SSM Session Manager only.
+
+**Result: pass.** All four services built and came up healthy, both GPU services see the
+L4, and a full hloc SfM reconstruction completed end to end.
+
+### Host
+
+| | |
+|---|---|
+| GPU | NVIDIA L4, 23034 MiB |
+| Driver | 595.91.07 (CUDA 13.2) |
+| Docker | 29.7.2 |
+| Compose | v5.5.0 |
+| RAM | 15 GiB usable |
+| vCPU | 4 |
+
+### Measurements
+
+| Metric | Value |
+|---|---|
+| **Build wall time** | **19 m 45 s** (`docker compose build`, cold, no cache) |
+| Cold `up -d` to all-healthy | 53 s |
+| **Peak host RAM** | **2921 MB** of 15 GiB — across build, startup, and reconstruction |
+| Peak RAM, build stage only | 1837 MB |
+| Idle RAM, four services up | 1.4 GiB |
+| **Peak VRAM** | **3796 MB** of 23034 MiB (16 %) |
+| Idle VRAM | 3 MiB — nothing is resident until work arrives |
+| Peak 1-min load | 7.03 on 4 vCPU |
+
+### Image sizes
+
+| Image | Size |
+|---|---|
+| `openvps-backend` | 41.5 GB |
+| `openvps-maplocalizer` | 40.7 GB |
+| `openvps-mapaligner` | 267 MB |
+| `openvps-frontend` | 74.2 MB |
+| Total on disk after layer sharing | 65.53 GB |
+
+The two large images are nearly identical in content — both are
+`nvidia/cuda:11.8.0-cudnn8-devel-ubuntu22.04` plus the COLMAP/hloc toolchain plus PyTorch —
+so layer sharing recovers most of the apparent 82 GB.
+
+### Disk — the brief's 40 GB root is not viable
+
+| State | Root used |
+|---|---|
+| AMI, freshly booted, nothing built | 50 GB |
+| Peak during build (images + build cache) | **146 GB** |
+| Steady state after `docker builder prune -af` | **112 GB** |
+
+The Deep Learning AMI alone is 50 GB before anything is built. Steady state is 112 GB, and
+a rebuild transiently needs another ~71 GB of build cache on top. A 40 GB root cannot even
+hold the AMI.
+
+Sizing conclusion: **200 GB gp3 root**, which leaves room to rebuild in place. 160 GB works
+only if the build cache is pruned before every rebuild. Using a plain Ubuntu AMI instead
+would reclaim roughly 50 GB, at the cost of installing and maintaining the NVIDIA driver,
+Docker, and the container toolkit — the DLAMI's reliability is worth the disk here.
+
+### Functional verification
+
+| Check | Result |
+|---|---|
+| `docker run --gpus all nvidia/cuda:12.4.0-base nvidia-smi` | GPU 0: NVIDIA L4 |
+| `frontend` :80 | HTTP 200, `<title>OpenVPS MapBuilder</title>` |
+| `frontend` :443 (upstream self-signed cert) | HTTP 200 |
+| `backend` `/healthcheck` | HTTP 200 `OK` |
+| `backend` `/maps` via frontend proxy | HTTP 401 — auth enforced, Auth.js wiring live |
+| `maplocalizer` `/openapi.json` | valid FastAPI 3.1.0 schema |
+| `mapaligner` `/` | HTTP 200 |
+| `torch.cuda.is_available()` in `backend` | True — 2.4.1+cu121, NVIDIA L4 |
+| `torch.cuda.is_available()` in `maplocalizer` | True — 2.4.1+cu121, NVIDIA L4 |
+| `pycolmap` | 3.13.0 — confirms the `c13273b` pairing |
+
+Only `backend` defines a healthcheck upstream. The other three report `running`, not
+`healthy`; the checks above were done by hand. Worth adding healthchecks in the override
+file so the waker can tell "up" from "serving".
+
+### End-to-end SfM reconstruction
+
+Ran hloc's `sacre_coeur` set (10 real images, ~1000×700) through the exact stages
+`hloc_build_map.py` uses, with OpenVPS's default confs — `superpoint_aachen`, `superglue`,
+`netvlad`, retrieval-based pairs.
+
+```
+netvlad-retrieval-extract    peak VRAM alloc 1353.9 MB   reserved 3514 MB
+pairs-from-retrieval
+superpoint-extract     0.4s
+superglue-match        3.7s
+colmap-reconstruction  3.8s
+TOTAL 39.4s for 10 images (3.9 s/img)
+10 registered images, 1786 points3D, 7817 observations, mean reproj. error 0.985 px
+```
+
+Host-wide peak during the run: 2849 MB RAM, 3796 MB VRAM.
+
+### Localizer VRAM, measured directly
+
+Loading the three models the localizer keeps resident:
+
+| Model | Load time | Cumulative VRAM allocated |
+|---|---|---|
+| SuperPoint | 0.4 s | 5.0 MB |
+| NetVLAD | 26.7 s | 573.4 MB |
+| SuperGlue (outdoor) | 0.2 s | 619.3 MB |
+
+Forward passes, batch of one:
+
+| Input | VRAM reserved |
+|---|---|
+| 1024×768 | 1992 MB |
+| 1920×1440 (native StrayScanner) | 6044 MB |
+
+VRAM scales with image resolution, not with scan size — inference is batch-of-one
+throughout. Even at native resolution the ceiling is ~6 GB against 23 GB available.
+
+---
+
+## Phase 1 frictions
+
+### 7. NetVLAD downloads 529 MB at first use, into the container writable layer
+
+The largest runtime surprise. SuperPoint (5 MB) and SuperGlue (46 MB) ship inside the image
+under `/app/hloc/third_party`, but NetVLAD's 529 MB checkpoint is **not** baked in — it is
+fetched on first use into `/root/.cache/torch`, taking 26.7 s.
+
+`docker inspect` confirms the only mount on `maplocalizer` is the maps bind, so that cache
+lives in the container's writable layer. It survives `stop`/`start`, but any `compose up`
+that *recreates* the container discards it — and user-data running `compose up -d` on every
+boot will recreate containers whenever the config changes. The result would be a silent
+529 MB download and a ~27 s stall on the first localization after a wake, which is exactly
+the latency the waker design is trying to avoid.
+
+Fix in the override file: mount a persistent volume at `/root/.cache/torch` for both
+`backend` and `maplocalizer`. Pre-warming it during Phase 2 user-data is also worth doing.
+
+### 8. hloc requests more DataLoader workers than a `g6.xlarge` has cores
+
+During matching:
+
+> `UserWarning: This DataLoader will create 5 worker processes in total. Our suggested max
+> number of worker in current system is 4`
+
+hloc's configs assume more than 4 vCPU. It is a warning, not an error, but it means the
+4-vCPU instance is oversubscribed during the CPU-heavy stages. Feeds the sizing question
+below.
+
+### 9. `maplocalizer`'s `.env` ends up with duplicate keys
+
+The Dockerfile appends `uploadsDir=/uploads` to a `server/.env` that already ships with
+`uploadsDir=/path/to/your/maps`, so the file contains the key twice. The later assignment
+wins with the loader in use, so behaviour is correct today — but it is fragile and reads as
+a mistake. Cosmetic; upstream-worthy.
+
+### 10. `MAPBUILDER_URL` resolved
+
+Setting it makes `docker compose config` parse with no unset-variable warnings, confirming
+it is genuinely required rather than vestigial. It is consumed by `mapaligner` to link back
+to MapBuilder, so it must be MapBuilder's **public** URL, not an internal service name.
+
+### 11. `g6.xlarge` capacity is AZ-dependent
+
+`us-east-1a` and `us-east-1b` both returned `InsufficientInstanceCapacity`; `us-east-1c`
+succeeded. The template must not pin a single subnet — it needs several candidate subnets,
+or the stack will intermittently fail to launch through no fault of its own.
+
+---
+
+## Sizing recommendation: move the default to `g6.2xlarge`
+
+On-demand, `us-east-1`:
+
+| Type | vCPU | RAM | $/hr | vs xlarge |
+|---|---|---|---|---|
+| `g6.xlarge` | 4 | 16 GiB | $0.8048 | — |
+| `g6.2xlarge` | 8 | 32 GiB | $0.9776 | +21.5 % |
+| `t4g.nano` | 2 | 0.5 GiB | $0.0042 | ~$3.07/mo |
+
+**Neither the GPU nor RAM is the constraint.** Peak VRAM was 3796 MB of 23034 (16 %), and
+peak RAM 2921 MB of 15 GiB (19 %). Critically, `g6.xlarge` and `g6.2xlarge` carry the *same*
+L4 with the same 22.4 GiB — so stepping up buys CPU and system RAM only, and the GPU is
+already oversized for this workload at either size.
+
+**CPU is the constraint.** Load hit 7.03 on 4 vCPU during the build, and hloc explicitly
+asks for 5 DataLoader workers on a 4-core box. COLMAP's incremental mapper and bundle
+adjustment are CPU-parallel and are the long pole in map building — the one operation whose
+duration a user actually waits on.
+
+The argument for `2xlarge` is that it doubles the scarce resource for 21.5 % more, and at
+this duty cycle the absolute difference is negligible: at 2 h/day it is about $10.50/month
+versus $8.65. The idle-shutdown timer means we pay for work done, not time elapsed, so the
+faster instance may not even cost more per map built.
+
+**Honest limit on this recommendation.** The reconstruction measured here was 10 images. A
+real StrayScanner scan is hundreds of frames, and COLMAP's memory grows with registered
+images and 3D points. Nothing in the measurements suggests 16 GiB would be exceeded, but
+that has not been demonstrated, and it is the one variable that could independently force
+`2xlarge`. Re-measure with a real multi-GB scan when one is available.
+
+`InstanceType` stays a parameter either way, and resizing is a stop-modify-start with the
+data volume detached from the question entirely.

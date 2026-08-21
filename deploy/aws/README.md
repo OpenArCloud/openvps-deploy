@@ -8,21 +8,22 @@ Upstream's `docker-compose.yaml` is used **unmodified**. Everything AWS-specific
 `docker-compose.aws.yaml`, applied as a Compose override, so this deployment can track
 upstream without maintaining a fork.
 
-> **Status:** Phase 1 (manual bring-up) in progress. The CloudFormation template is not
-> written yet. See [NOTES.md](NOTES.md) for measurements and the running friction log.
+> **Status:** Phase 1 (manual bring-up) passed — all four services built and verified on a
+> `g6.xlarge`, including an end-to-end hloc SfM reconstruction. The CloudFormation template
+> is not written yet. See [NOTES.md](NOTES.md) for measurements and the friction log.
 
 ## Design
 
 ```
               cloudpose.io  (Route 53)
                      │
-   t4g.nano "waker"  │  always on, ~$3/mo
+   t4g.nano "waker"  │  always on, ~$3.07/mo
      Caddy holds the domain and terminates TLS
        ├─ GPU instance stopped → holding page + StartInstances
        └─ GPU instance running → reverse proxy
                      │
-   g6.xlarge "openvps"  started on demand
-     gp3 root 40 GB    Docker images + HLOC weights, survives stop
+   g6.2xlarge "openvps"  started on demand
+     gp3 root 200 GB   Docker images + HLOC weights, survives stop
      gp3 data 200 GB   → /home/ubuntu/data/maps  (MY_SHARED_MAPS_DIR)
      docker compose up: backend, mapaligner, maplocalizer, frontend
      idle-shutdown timer
@@ -66,7 +67,24 @@ key pair and no SSH ingress.
 
 ## Cost
 
-_Filled in once Phase 1 measurements land._
+On-demand, `us-east-1`, from Phase 1 measurements.
+
+| Component | Rate | Notes |
+|---|---|---|
+| `g6.2xlarge` GPU host | $0.9776/hr | only while awake |
+| `g6.xlarge` alternative | $0.8048/hr | 4 vCPU; see the sizing note in NOTES.md |
+| `t4g.nano` waker | $0.0042/hr | ~$3.07/mo, always on |
+| gp3 root, 200 GB | ~$16/mo | standing; survives instance stop |
+| gp3 data, 200 GB | ~$16/mo | standing; `DeletionPolicy: Retain` |
+| Elastic IP | ~$3.60/mo | standing while allocated |
+
+Standing cost is therefore about **$39/mo** with the GPU host stopped, plus roughly
+**$0.98 per awake hour**. At 2 h/day the GPU adds about $59/mo.
+
+The root volume is 200 GB because measurement demanded it, not by preference: the Deep
+Learning AMI occupies 50 GB before anything is built, steady state after building all four
+images is 112 GB, and an in-place rebuild transiently needs a further ~71 GB of build
+cache. A 40 GB root cannot hold the AMI.
 
 ## Teardown
 
