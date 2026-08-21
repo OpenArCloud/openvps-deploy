@@ -1,5 +1,6 @@
 #!/bin/bash
-# Copyright 2026 — OpenVPS AWS deployment
+# Copyright 2026 Open AR Cloud
+# Licensed under the MIT License.
 # SPDX-License-Identifier: MIT
 #
 # Stops the GPU instance once nothing has used it for IDLE_MINUTES.

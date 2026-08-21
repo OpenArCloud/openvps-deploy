@@ -1,5 +1,6 @@
 #!/bin/bash
-# Copyright 2026 — OpenVPS AWS deployment
+# Copyright 2026 Open AR Cloud
+# Licensed under the MIT License.
 # SPDX-License-Identifier: MIT
 #
 # Sets the FusionAuth tenant issuer to the public URL, after FusionAuth is up.
