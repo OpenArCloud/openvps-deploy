@@ -806,3 +806,35 @@ Ports on the GPU host, all reachable only from the waker's security group:
 
 Port 443 on the frontend is bound to `127.0.0.1` and carries upstream's self-signed cert;
 ignore it. Caddy terminates TLS and speaks plain HTTP to port 80.
+
+---
+
+## Session teardown, 2026-08-21
+
+Everything created for testing was removed. Final state verified by API, not assumed:
+
+| Resource | State |
+|---|---|
+| All `Project=openvps-aws` EC2 instances | terminated (3, including the Phase 1 box) |
+| All `Project=openvps-aws` EBS volumes | none remaining |
+| `openvps-aws-test` stack | deleted |
+| Phase 1 IAM role + instance profile | deleted |
+| Phase 1 security group | deleted |
+| Capacity-probe instances | all terminated |
+| CloudWatch log groups | none remaining |
+
+The Phase 1 instance was terminated rather than left stopped: its purpose was served once
+the template built from zero reliably, and keeping it meant ~$20/mo for a 250 GB root
+volume whose only value was skipping a 23-minute rebuild.
+
+**One thing deliberately kept:** the Secrets Manager entry
+`openvps-aws/PLACEHOLDER-replace-before-real-use` (~$0.40/mo). It holds a random
+`AUTH_SECRET` and dummy FusionAuth values with a `_README` key saying so. It exists only so
+the stack could be deployed end to end. **Login does not work against it.** Replace the
+values with real FusionAuth application credentials, or delete it and pass a different
+`SecretsManagerArn`.
+
+Also worth noting: the maps volume was observed surviving `delete-stack` twice — once as
+`available` after a failed stack, and once as `MapsVolume DELETE_SKIPPED` in the events of
+a clean deletion. Retention works, and it means teardown leaves a billing tail unless the
+volume is deleted deliberately.
