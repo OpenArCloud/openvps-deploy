@@ -1,0 +1,32 @@
+# Working notes / briefs — not for the public repo
+directions/
+
+# Secrets & credentials — never commit
+.env
+.env.*
+!.env.example
+docker.env
+*.pem
+*.key
+*.p12
+*.pfx
+credentials
+aws-credentials*
+.aws/
+*secret*.json
+*secrets*.json
+!*secrets*.example.json
+
+# Terraform/CFN local state & params that may carry ARNs or IDs
+*.tfstate
+*.tfstate.*
+.terraform/
+parameters.local.json
+cfn-params.local.json
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
