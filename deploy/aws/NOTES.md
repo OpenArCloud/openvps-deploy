@@ -352,3 +352,363 @@ that has not been demonstrated, and it is the one variable that could independen
 
 `InstanceType` stays a parameter either way, and resizing is a stop-modify-start with the
 data volume detached from the question entirely.
+
+---
+
+## Phase 2 — CloudFormation
+
+### The AZ trap: capacity and a retained volume pull in opposite directions
+
+Phase 1 found `g6.xlarge` capacity is AZ-dependent (friction 11), which argues for a
+template that can try several subnets. But an EBS volume is bound to one AZ for life, and
+the maps volume is `DeletionPolicy: Retain` precisely so it outlives stacks. **Those two
+requirements are in direct conflict**, and the volume wins: once maps exist in
+`us-east-1c`, the instance can only ever launch in `us-east-1c`.
+
+So the template takes a single `SubnetId` and treats that choice as permanent. There is no
+multi-AZ fallback, because a fallback that stranded the data would be worse than a failure.
+The parameter description says so plainly.
+
+The consequence is an **operational risk worth naming**: when the waker calls
+`StartInstances` on the stopped GPU host, that start can fail with
+`InsufficientInstanceCapacity` if the pinned AZ is momentarily full — and unlike a fresh
+launch, there is nowhere else to go. Options, none of them free:
+
+- Accept it. A wake occasionally fails and retries later. Costs nothing.
+- An On-Demand Capacity Reservation in the pinned AZ. Removes the risk entirely, but bills
+  the full instance rate whether or not the instance is running — which defeats the point
+  of the on-demand design.
+- Keep a snapshot and be prepared to restore into another AZ. Cheap, manual, slow.
+
+Recommend accepting it, with the snapshot as the disaster path. Flagged rather than buried
+because it is the one failure mode this architecture cannot self-heal.
+
+### Elastic IP: defaulted off, deliberately
+
+The brief puts an Elastic IP on the GPU instance. The template supports that
+(`AttachElasticIp`) but defaults it to `false`, because the GPU host does not appear to
+need one:
+
+- The waker reaches it over the VPC by **private IP**, which is already stable across
+  stop/start — an EIP would add nothing.
+- Outbound access for image pulls comes from the subnet's auto-assigned public IPv4.
+- Public IPv4 now bills at ~$3.60/mo per address whether attached or idle.
+
+The waker is what DNS points at and what genuinely needs an address that never moves, and
+the guardrails pre-approve exactly one Elastic IP. Reserving it for the waker seemed the
+better use. Set `AttachElasticIp=true` to get the brief's original arrangement.
+
+### Why the waker security group is created here
+
+The GPU group's only ingress source is the waker's group, so the waker group has to exist
+before the GPU group can name it. It is created empty in this template, with no instance
+attached; Phase 4 launches the waker into it. Ingress rules are separate
+`AWS::EC2::SecurityGroupIngress` resources rather than inline, which is what avoids a
+circular dependency between the two groups.
+
+### Device naming, and a circular dependency avoided
+
+Device names are not stable on Nitro: `/dev/sdf` in the attachment surfaces as
+`/dev/nvmeXn1` with an unpredictable index. The obvious fix is to match on the NVMe serial,
+which carries the EBS volume id — but referencing `MapsVolume` from user-data creates a
+cycle, because `MapsVolume` takes its AZ from `Instance`. User-data therefore identifies
+the data disk as *the whole disk that is not the root disk*, which is unambiguous because
+exactly one extra volume is ever attached. It then mounts by UUID in `/etc/fstab` with
+`nofail`, so a missing volume produces a failed service rather than an unbootable host.
+
+### First boot vs every boot
+
+`cloud-init` user-data runs once. Bringing the stack up has to happen on **every** boot,
+including after the idle-shutdown timer stops the instance. So user-data does one-time
+setup — volume, clone, build — and installs `openvps.service`, a `oneshot`
+`RemainAfterExit` unit that owns `compose up` from then on.
+
+`ExecStartPre` re-renders `docker.env` from Secrets Manager on every start, so a rotated
+secret is picked up by a stop/start with no redeploy. `docker.env` is written with
+`umask 077` and `chmod 600`, and the renderer never echoes a value.
+
+### Failing fast
+
+Two deliberate choices, both about not wasting 50 minutes:
+
+- User-data checks for outbound internet before doing anything else. Without a NAT gateway
+  the subnet must be public with auto-assign public IPv4 on; if it is not, every clone and
+  pull would fail slowly. The check catches it in seconds.
+- Every error path calls `signal FAILURE`, so `CreationPolicy` rolls back promptly instead
+  of waiting out its `PT50M` timeout.
+
+### Build cache is pruned on first boot
+
+Phase 1 measured ~71 GB of build cache on top of a 112 GB steady state. User-data runs
+`docker builder prune -af` after building, which is what makes a 200 GB root comfortable
+rather than marginal.
+
+### Three bugs the first stack deployment exposed
+
+Recorded in full because two of them are the kind that pass every test and then bite in
+production.
+
+**1. `CreationPolicy` on the instance deadlocks against the volume attachment.**
+
+The natural way to gate stack completion on a successful bootstrap is a `CreationPolicy`
+with a resource signal. It cannot work here. `MapsVolumeAttachment` depends on `Instance`,
+so CloudFormation waits for user-data to signal success *before* attaching the volume —
+while user-data is waiting for that volume to appear. Neither side can move.
+
+The fix is a `WaitCondition` that `DependsOn: Instance` instead. The instance reaches
+`CREATE_COMPLETE` as soon as it is running, the attachment proceeds, user-data finds the
+disk, and the signal goes to the wait handle rather than to the instance resource.
+
+**2. "The disk that is not the root disk" selects the instance store — and would have
+destroyed every map.**
+
+The first version identified the data volume by elimination: the one whole disk that is not
+the root disk. That is wrong on precisely the hardware recommended here. **Every g6 ships an
+instance-store SSD** — 250 GB on `g6.xlarge`, 450 GB on `g6.2xlarge`:
+
+```
+g6.xlarge    InstanceStore=True   250 GB ssd
+g6.2xlarge   InstanceStore=True   450 GB ssd
+```
+
+So there are two non-root disks, and the loop would have settled on whichever came last —
+quite possibly the ephemeral one. It would then have formatted it, mounted it at
+`MY_SHARED_MAPS_DIR`, and worked flawlessly. Until the first stop/start, at which point
+instance-store contents are gone and every map with them.
+
+This one deserves emphasis because of what Phase 3 is: an idle-shutdown timer whose entire
+job is to stop the instance regularly. The bug would not have been a rare edge case, it
+would have fired on a routine automated event, and the failure would have looked like
+"maps mysteriously disappeared overnight" rather than anything traceable to volume setup.
+
+The fix keys on the NVMe serial. EBS volumes report a serial of the form `vol0123abc…`;
+instance-store disks do not. Filtering on that prefix, and excluding the root disk by name,
+is unambiguous — and it does not reintroduce the `MapsVolume` reference that would recreate
+the dependency cycle.
+
+**3. The fail-fast egress probe was itself too aggressive.**
+
+The single-shot connectivity check fired 51 seconds into boot and failed the stack, even
+though the instance did have a public IP (`3.85.208.87`) in a subnet with
+`MapPublicIpOnLaunch=true`. A check meant to save 50 minutes cost a full deploy cycle
+instead. It now retries for 90 seconds and, before giving up, dumps `ip -br addr`, the
+route table, `/etc/resolv.conf`, and a DNS lookup — so the next failure explains itself.
+
+**Process note.** The first attempt used `--on-failure DELETE`, so the rollback terminated
+the instance and took the bootstrap log with it, leaving only "Received FAILURE signal" to
+work from. Use `--on-failure DO_NOTHING` while iterating on user-data; the cost of a
+lingering failed stack is far smaller than the cost of a blind retry.
+
+### Capacity is volatile enough to change the design's risk profile
+
+The AZ trap described above was written as a theoretical concern. It then materialised
+twice in one session, in opposite directions:
+
+| Time | Type | Outcome |
+|---|---|---|
+| Phase 1 | `g6.xlarge` | refused in `us-east-1a` and `1b`; launched in `1c` |
+| Phase 2 | `g6.2xlarge` | refused in `1c`; AWS named `1a`, `1b`, `1d`, `1f` as available |
+
+Capacity is specific to **both** AZ and instance type, and it moved within a few hours. The
+AZ that worked for Phase 1 was the one that failed for Phase 2.
+
+Two conclusions:
+
+- Pinning the AZ is not a rare-disaster risk, it is a routine operating condition. A waker
+  `StartInstances` will eventually fail with `InsufficientInstanceCapacity` and have
+  nowhere to fall back to.
+- An AZ-migration runbook is mandatory, not optional. It is now in the README as a normal
+  procedure, along with a `run-instances --dry-run` capacity probe to run *before*
+  committing to a subnet.
+
+This also retroactively justifies keeping the maps volume as a separate `Retain`ed resource
+rather than a block-device mapping on the instance: it is what turns an AZ move into a
+snapshot-and-restore instead of a rebuild-and-lose-everything.
+
+### Device detection: proof, and why the original heuristic was worse than it looked
+
+Block devices on the deployed `g6.2xlarge`:
+
+```
+nvme0n1  vol08e755c8bb951d66c  disk  200G                → root (/)
+nvme1n1  AWS21A4D01387D1732F0  disk  419.1G LVM2_member  → /opt/dlami/nvme  (instance store)
+nvme2n1  vol0ec604ebcc8e5c53a  disk  200G   ext4         → /home/ubuntu/data/maps
+```
+
+The serial-prefix rule works: `nvme2n1` was selected, `nvme1n1` skipped.
+
+The instance store turns out to be a worse trap than first assessed. **The Deep Learning AMI
+already formats it** — as an LVM volume group mounted at `/opt/dlami/nvme`. So under the
+original "not the root disk" heuristic, the loop would have landed on `nvme1n1`, found an
+existing filesystem via `blkid`, taken the "existing filesystem found; leaving it alone"
+branch, and mounted the ephemeral disk as `MY_SHARED_MAPS_DIR` **without formatting
+anything and without emitting a single error**. Bootstrap would have reported success.
+
+The failure would then have surfaced only after the first stop/start, as maps that silently
+vanished — with nothing in any log pointing at volume setup. The serial check is what makes
+this deterministic rather than a coin flip on device enumeration order.
+
+### Healthchecks: two separate bugs, both mine
+
+The first end-to-end deploy built all four images and started all four containers, then
+failed because `openvps.service` used `--wait` and two of the healthchecks I added never
+passed. Upstream's `backend` check was fine throughout. Both bugs are in the checks, not the
+services — the services were serving correctly the whole time.
+
+**`localhost` resolves to `::1` first.** These alpine images ship an `/etc/hosts` mapping
+`localhost` to both `127.0.0.1` and `::1`; busybox wget tries IPv6 first; nginx listens on
+`0.0.0.0:80` only. So `wget http://localhost/` returns "Connection refused" against a
+perfectly healthy service. Use `127.0.0.1` explicitly, never `localhost`, in a container
+healthcheck.
+
+**MapAligner's `/` redirects to a public URL.** Its Next.js middleware sends unauthenticated
+requests to `${AUTH_URL}/api/auth/signin` — an absolute, *public* URL, which here is
+`https://align.vps.cloudpose.io/...`. busybox wget follows redirects, so the check failed
+with `bad address` and would have kept failing until public DNS existed. A healthcheck must
+never depend on external DNS. The middleware's matcher explicitly excludes `api/auth`,
+`_next/static`, `_next/image` and `favicon.ico`, so `/favicon.ico` answers 200 directly with
+no redirect and no auth — that is the correct target.
+
+Also: busybox wget has no `--tries` option (`wget [-cqS] [--spider] [-O FILE] ... [-T SEC]`).
+Replaced with `-T 5`.
+
+**A healthcheck must not create the activity it measures.** These checks hit nginx every 10
+seconds and land in its access log, which the Phase 3 idle detector reads. Healthcheck
+traffic originates from `127.0.0.1`, so the idle detector filters that source out —
+otherwise the instance would never appear idle and would never shut down.
+
+### Measured: cold stack to serving
+
+On `g6.2xlarge` in `us-east-1d`:
+
+```
+05:02:34  bootstrap starts
+05:02:48  build starts        (14s for volume, clone, config)
+05:26:18  build done          23m30s
+```
+
+Roughly **25 minutes from `create-stack` to serving**, against Phase 1's 19m45s for the
+build alone on a `g6.xlarge` — the extra covers clone, HLOC submodules, build-cache prune,
+and container start. The `WaitCondition` timeout of 3600s has comfortable margin.
+
+Disk after bootstrap, confirming the Phase 1 sizing: root 194 GiB total, **111 GiB used**,
+84 GiB free — within a gigabyte of the 112 GB Phase 1 predicted.
+
+---
+
+## Phase 3 — Idle shutdown
+
+A `systemd` timer (`openvps-idle.timer`, every 5 minutes) runs
+`/usr/local/bin/openvps-idle-shutdown`. Threshold is the `IdleShutdownMinutes` stack
+parameter, written to `/opt/openvps/idle.conf`; `0` disables shutdown without masking the
+unit. The instance is **stopped**, not terminated — the root volume keeps the built images
+and the HLOC cache.
+
+The brief specifies "no CUDA compute process and no Caddy request for 30 minutes". Caddy
+lives on the waker, which does not exist until Phase 4, so the on-host equivalents are used
+and the check is deliberately wider than the brief:
+
+| Signal | Rationale |
+|---|---|
+| `nvidia-smi --query-compute-apps` non-empty | Authoritative: a map is building or a localization is in flight |
+| Established off-box TCP connection to :80/:3001/:8000 | A client is connected right now, even if idle mid-request |
+| Non-loopback HTTP request in any service log within the window | Recent user traffic |
+| A file written under `MY_SHARED_MAPS_DIR` within the window | Catches long CPU-only stages — COLMAP bundle adjustment, zip extraction — that hold no CUDA context and serve no HTTP |
+
+The fourth exists because the brief's two conditions are not jointly sufficient. COLMAP's
+bundle adjustment is CPU-bound and can run for many minutes with no CUDA context and no
+HTTP traffic; on the brief's criteria alone the instance would shut down mid-reconstruction.
+
+### The monitor must not create the activity it measures
+
+The healthchecks added in Phase 2 hit each service every 10 seconds, and those requests land
+in the same access logs the idle detector reads. Left unfiltered, the host would report busy
+forever and never shut down — the timer would appear to work while quietly never firing.
+
+Filtering loopback is the fix, but the first attempt got it half right and that is worth
+recording, because the failure was invisible:
+
+```
+nginx (frontend)         127.0.0.1 - - [21/Aug/2026:05:38:37 +0000] "GET / HTTP/1.1" 200
+uvicorn (maplocalizer)   INFO:     127.0.0.1:36072 - "GET / HTTP/1.1" 200 OK
+Next.js (mapaligner)     (does not log requests at all)
+```
+
+An anchored `^127\.0\.0\.1` filter matches nginx and misses uvicorn, whose client address is
+mid-line. So `maplocalizer` reported its own healthcheck as user traffic — observed live as
+`busy (http:openvps-maplocalizer-1:6)` on a host with no users at all. Matching `127.0.0.1`
+anywhere in the line covers all three formats.
+
+The general lesson: three services, three log formats, and a filter validated against only
+one of them. Test an idle detector against every service it reads, on a host you know to be
+idle, and confirm it actually reports idle — "no shutdown happened" is not evidence the
+logic works.
+
+### Verified behaviour
+
+Tested live with `shutdown`/`systemctl stop` stubbed out:
+
+| Case | Expected | Result |
+|---|---|---|
+| Healthcheck traffic only | idle → shut down | `idle 2m >= 1m; stopping compose and shutting down` |
+| Clock backdated 5 min | shut down | `idle 5m >= 1m` |
+| GPU compute process held | busy | `busy (gpu:1); resetting idle clock` |
+| `IDLE_MINUTES=0` | disabled | `idle shutdown disabled` |
+
+Shutdown stops `openvps.service` and `sync`s before `shutdown -h now`, so containers exit
+cleanly and any in-flight write to the maps volume is flushed before the filesystem goes.
+
+---
+
+## Capacity: the finding that most affects whether this architecture works
+
+Over roughly two hours in `us-east-1` on 2026-08-21, GPU capacity moved constantly. Every
+row is an observed `RunInstances` result, not a prediction:
+
+| Time (UTC) | Type | AZ | Result |
+|---|---|---|---|
+| ~03:47 | `g6.xlarge` | `1a`, `1b` | insufficient capacity |
+| ~03:47 | `g6.xlarge` | `1c` | launched |
+| 04:38 | `g6.2xlarge` | `1c` | insufficient capacity |
+| 04:44 | `g6.2xlarge` | `1a` | insufficient capacity |
+| ~04:50 | `g6.2xlarge` | `1a`, `1b`, `1f` | insufficient capacity |
+| ~04:50 | `g6.2xlarge` | `1c`, `1d` | available |
+| ~04:50 | `g6.xlarge` | `1a`, `1b`, `1d` | available |
+| ~04:50 | `g6.xlarge` | `1c`, `1f` | insufficient capacity |
+| 04:58 | `g6.2xlarge` | `1d` | launched |
+| 05:52 | `g6.2xlarge` | `1d` | insufficient capacity |
+
+`us-east-1d` went from serving a `g6.2xlarge` at 04:58 to refusing one at 05:52 — under an
+hour. `1c` refused `g6.2xlarge` at 04:38 and offered it at 04:50.
+
+### What this means for the design
+
+The architecture assumes a stopped instance can be started on demand. That assumption is
+weaker than it looks:
+
+- **A wake can fail.** `StartInstances` on a stopped instance needs capacity in the AZ the
+  instance is already in. There is no fallback, because the maps volume pins the AZ.
+- **A stop/start cycle is a gamble that repeats.** Phase 3's idle timer stops the instance
+  several times a day by design, so this is not a rare event — the system deliberately
+  re-enters the state where it needs capacity again.
+- **Deploys need retry logic**, which is why the repo carries a probe-then-deploy loop
+  rather than a single `create-stack`.
+
+### Options, for a decision that is not mine to make
+
+1. **Accept and retry.** Free. A wake occasionally fails; the waker retries, or the user
+   refreshes. Acceptable for a research/demo service, poor for anything with an SLA.
+2. **On-Demand Capacity Reservation** in the pinned AZ. Removes the risk completely and
+   guarantees the wake. Costs the full instance rate continuously whether the instance runs
+   or not — roughly $700/mo for a `g6.2xlarge`, which defeats the entire on-demand design.
+3. **Try a different GPU family.** `g5` (A10G, 24 GB) and `g4dn` (T4, 16 GB) are older and
+   often less contended than `g6`. Phase 1 measured peak VRAM at 3.8 GB against 22.4 GB
+   available, so the GPU is heavily over-provisioned for this workload and a smaller or
+   older card would very likely do. **This is the option worth investigating** and it was
+   not in scope for Phase 2 — the workload is CPU-bound, and `g6` was picked before the
+   capacity picture was known.
+4. **Keep the instance running.** Defeats the purpose and costs ~$700/mo.
+
+Recommendation: accept and retry for now, and evaluate `g5`/`g4dn` before this goes in
+front of users. The measurements say the GPU is not the constraint, so trading down on GPU
+to buy availability is close to free in performance terms.

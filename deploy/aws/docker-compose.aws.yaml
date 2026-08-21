@@ -1,0 +1,106 @@
+# Copyright 2026 — OpenVPS AWS deployment
+# SPDX-License-Identifier: MIT
+#
+# Compose override for running upstream OpenVPS on AWS behind the Caddy waker.
+# Upstream docker-compose.yaml is never edited; everything AWS-specific is here.
+#
+#   cd /opt/openvps/openvps
+#   docker compose -f docker-compose.yaml -f /opt/openvps/docker-compose.aws.yaml \
+#                  --env-file /opt/openvps/docker.env up -d
+#
+# Three things this file changes, each justified in NOTES.md:
+#
+#   1. Persists the HLOC model cache, so waking the instance does not re-download
+#      NetVLAD's 529 MB checkpoint (friction 7).
+#   2. Replaces the frontend's nginx config to lift its baked-in 5 GB request body
+#      cap, which would otherwise reject multi-GB StrayScanner uploads (friction 2).
+#   3. Adds healthchecks to the three services upstream leaves unchecked, so the
+#      waker can tell "container started" from "actually serving".
+#
+# Two things it deliberately does NOT change:
+#
+#   * shm_size stays at upstream's 4 GB. The README's bus-error remedy is already
+#     pre-applied upstream and no bus error was observed in Phase 1. If one appears
+#     under a large scan, raising it here is the fix — but changing it now would be
+#     guessing.
+#   * The frontend's 443 binding is not removed, because it cannot be: Compose
+#     concatenates the `ports` list across files rather than replacing it, so an
+#     override has no way to drop an upstream binding. It is neutralised instead by
+#     setting MAPBUILDER_PORT_HTTPS to "127.0.0.1:8443" in docker.env, which makes
+#     the published address loopback-only. Caddy talks to port 80.
+#
+# Host paths here are absolute on purpose. Compose resolves relative paths in an
+# override against the *project* directory — the upstream clone — and these files
+# deliberately live outside it so the clone stays pristine.
+
+name: openvps
+
+x-awslogs: &awslogs
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "5"
+
+services:
+  backend:
+    volumes:
+      # Upstream downloads NetVLAD (529 MB) to /root/.cache/torch on first use. Without
+      # this it lives in the container writable layer and is lost whenever the container
+      # is recreated, stalling the first request after a wake by ~27s.
+      - hloc_cache:/root/.cache/torch
+    logging: *awslogs
+
+  maplocalizer:
+    volumes:
+      - hloc_cache:/root/.cache/torch
+    healthcheck:
+      # curl is installed in this image by the upstream Dockerfile. Address 127.0.0.1
+      # rather than localhost — see the note on the frontend check below.
+      test: ["CMD", "curl", "--noproxy", "*", "--fail", "--silent", "--output", "/dev/null", "http://127.0.0.1:8000/"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+    logging: *awslogs
+
+  mapaligner:
+    healthcheck:
+      # node:22-alpine — busybox wget, no curl (and busybox wget has no --tries).
+      #
+      # Target /favicon.ico, not /. The Next.js middleware matcher explicitly excludes
+      # api/auth, _next/static, _next/image and favicon.ico; everything else redirects
+      # unauthenticated requests to `${AUTH_URL}/api/auth/signin` — a *public* URL. busybox
+      # wget follows that redirect, so checking / makes container health depend on public
+      # DNS resolving, and the container is marked unhealthy with "bad address" until it
+      # does. /favicon.ico answers 200 directly with no redirect and no auth.
+      test: ["CMD", "wget", "--quiet", "--spider", "-T", "5", "http://127.0.0.1:3001/favicon.ico"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    logging: *awslogs
+
+  frontend:
+    volumes:
+      # Replaces the image's baked-in default.conf. Upstream sets
+      # client_max_body_size 5000M in both server blocks and COPYs the file in at build
+      # time, so it cannot be raised by environment variable. Our copy sets it to 0
+      # (unlimited) and drops the TLS server block, since Caddy terminates TLS.
+      - /opt/openvps/nginx/mapbuilder.conf:/etc/nginx/conf.d/default.conf:ro
+    healthcheck:
+      # nginx:1.27-alpine — busybox wget, no curl (and busybox wget has no --tries).
+      #
+      # 127.0.0.1, never localhost. The image's /etc/hosts maps localhost to both 127.0.0.1
+      # and ::1, busybox wget tries ::1 first, and nginx listens on 0.0.0.0:80 only — so
+      # `http://localhost/` fails with "Connection refused" while the service is perfectly
+      # healthy.
+      test: ["CMD", "wget", "--quiet", "--spider", "-T", "5", "http://127.0.0.1:80/"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+    logging: *awslogs
+
+volumes:
+  hloc_cache:
+    name: openvps_hloc_cache
