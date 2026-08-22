@@ -48,7 +48,18 @@ services:
       options: {max-size: "20m", max-file: "3"}
 
   fusionauth:
-    image: fusionauth/fusionauth-app:1.69.0
+    # Pinned to 1.49.2 deliberately, NOT latest. FusionAuth 1.50 added OAuth scope consent,
+    # and upstream OpenVPS hardcodes `offline_access` in the requested scope
+    # (mapbuilder/Backend/src/auth.ts and mapaligner/lib/auth.js). On 1.50+ every login is
+    # redirected to /oauth2/consent, and that page returns HTTP 500 — so login is simply
+    # impossible. Verified that consentMode=NeverPrompt, scopeHandlingPolicy=Compatibility,
+    # unknownScopePolicy=Allow and relationship=FirstParty do NOT avoid it, and that
+    # offline_access cannot be added to providedScopePolicy (only the standard OIDC scopes
+    # are accepted there). Login works on 1.49.2 with no consent step at all.
+    #
+    # Before bumping this, test a real login end to end. A healthy container proves nothing
+    # here: FusionAuth comes up fine and only fails when someone tries to sign in.
+    image: fusionauth/fusionauth-app:1.49.2
     depends_on:
       db:
         condition: service_healthy

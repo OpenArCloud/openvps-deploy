@@ -24,6 +24,15 @@ Operator guide. For what this repo is and how the pieces fit, see the
    You generate these; FusionAuth is configured to use them rather than making its own. That
    way the client id and secret agree on both sides without any copying back and forth.
    `AUTH_FUSIONAUTH_ISSUER` is optional and defaults to `https://auth.<DomainName>`.
+
+   `AUTH_FUSIONAUTH_SECRET` must be **alphanumeric only**. Auth.js authenticates with
+   `client_secret_basic`, and a base64 secret containing `+`, `/` or `=` makes FusionAuth
+   reject the token exchange with `invalid_client` even though both sides hold identical
+   values. Generate it with:
+
+   ```sh
+   tr -dc 'A-Za-z0-9' </dev/urandom | head -c 48
+   ```
 3. **A domain**, with a Route 53 hosted zone. Four names point at the waker: `build`,
    `align`, `vps` and `auth`. Or use `sslip.io` against the waker's IP and skip DNS setup.
 4. **An availability zone with capacity.** See below.
@@ -67,6 +76,27 @@ but not `g6.2xlarge` you can never move up.
 was available in one, costs 23% less, and produces identical reconstructions. Its T4 is
 slower at SuperGlue matching, which matters more as scans get larger. NOTES.md has the
 numbers.
+
+## Using it
+
+Two things trip people up on first use:
+
+**Keep the zip's original name.** `stray_zip_extract.py` works out the directory it expects
+inside the archive from the filename, so `c041e1cfc2.zip` must still be called that. Rename
+it to `scan.zip` and extraction fails with `No such file or directory: /tmp/tmpXXXX/scan`,
+which does not obviously point at the filename.
+
+**A map needs a georeference before it can be served.** MapLocalizer's `load_map` requires a
+`transform.json` beside the reconstruction and returns
+`Failed to load map transform <id>` without one. MapAligner writes it; you can also POST one
+directly:
+
+```sh
+curl -X POST -H 'Content-Type: application/json' \
+  -d '{"latitude":47.4979,"longitude":19.0402,"height":100.0,
+       "matrix":[[1,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,0,1]]}' \
+  https://build.<domain>/maps/<datasetId>/hloc/<mapId>/transform
+```
 
 ## Deploying
 
@@ -183,6 +213,23 @@ aws cloudformation delete-stack --stack-name openvps-aws
 The maps volume has `DeletionPolicy: Retain`, so this leaves it behind on purpose. Two
 consequences: a recreated stack will not adopt it, you have to attach it by hand; and it
 keeps billing until you delete it.
+
+If you want the maps but not the bill, snapshot the volume and delete it. Snapshots are
+charged on used blocks after compression, so a volume holding a couple of maps costs pennies
+a month against $16 for an idle 200 GB volume.
+
+```sh
+SNAP=$(aws ec2 create-snapshot --volume-id <maps-volume-id> \
+        --description "openvps maps" \
+        --tag-specifications 'ResourceType=snapshot,Tags=[{Key=Project,Value=openvps-aws}]' \
+        --query SnapshotId --output text)
+aws ec2 wait snapshot-completed --snapshot-ids "$SNAP"   # only delete once this returns
+aws ec2 delete-volume --volume-id <maps-volume-id>
+```
+
+Restoring: create a volume from the snapshot in the AZ of the new stack, stop the instance,
+detach the empty maps volume, attach the restored one as `/dev/sdf`, start. User-data mounts
+by UUID and will not reformat a volume that already has a filesystem.
 
 ```sh
 aws ec2 describe-volumes --filters Name=tag:Project,Values=openvps-aws Name=status,Values=available \

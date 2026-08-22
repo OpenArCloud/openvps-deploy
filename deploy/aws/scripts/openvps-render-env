@@ -1,4 +1,12 @@
 #!/bin/bash
+#
+# NOTE on AUTH_FUSIONAUTH_SECRET: it must be ALPHANUMERIC ONLY.
+# Auth.js authenticates to the token endpoint with client_secret_basic. A base64 secret
+# containing "+", "/" or "=" makes FusionAuth reject the exchange with
+#   invalid_client — "Invalid client authentication credentials."
+# even though the client id and secret match exactly on both sides. This is easy to
+# misdiagnose as a configuration mismatch. Generate with:
+#   tr -dc 'A-Za-z0-9' </dev/urandom | head -c 48
 # Fetches secrets and writes docker.env. Never logs the values.
 set -uo pipefail
 BASE=/opt/openvps
@@ -15,8 +23,18 @@ if [ -n "$DOMAIN" ]; then
   LOCALIZER="$SCHEME://vps.$DOMAIN"
   ISSUER_DEFAULT="$SCHEME://auth.$DOMAIN"
 else
-  BUILDER="http://localhost"; ALIGNER="http://localhost:3001"
-  LOCALIZER="http://localhost:8000"; ISSUER_DEFAULT="http://localhost:9011"
+  # No domain: address everything by the host's private IP, never localhost.
+  #
+  # Auth.js exchanges the authorization code for tokens SERVER-SIDE, so the backend and
+  # mapaligner containers have to reach the issuer themselves. FusionAuth runs in a separate
+  # compose project, so it is not on their docker network and not resolvable by service
+  # name; and inside a container "localhost" is the container, not the host. The private IP
+  # is the one address that works from the containers, from the host, and from a browser
+  # inside the VPC.
+  HOST_IP="$(curl -sf -H "X-aws-ec2-metadata-token: $(curl -sf -X PUT       -H 'X-aws-ec2-metadata-token-ttl-seconds: 300'       http://169.254.169.254/latest/api/token)"       http://169.254.169.254/latest/meta-data/local-ipv4)"
+  [ -n "$HOST_IP" ] || HOST_IP="$(hostname -I | awk '{print $1}')"
+  BUILDER="http://$HOST_IP"; ALIGNER="http://$HOST_IP:3001"
+  LOCALIZER="http://$HOST_IP:8000"; ISSUER_DEFAULT="http://$HOST_IP:9011"
 fi
 ISSUER="$(get AUTH_FUSIONAUTH_ISSUER)"; [ -n "$ISSUER" ] || ISSUER="$ISSUER_DEFAULT"
 

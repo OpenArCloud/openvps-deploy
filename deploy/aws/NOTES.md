@@ -1168,3 +1168,141 @@ change to `DomainName` silently leaves a stale issuer in place, with login faili
 validation for reasons nothing surfaces. `openvps-fusionauth-configure` runs as
 `ExecStartPost` on every start, is idempotent, and verifies the result, so the issuer tracks
 the stack parameter.
+
+---
+
+## End-to-end test on a real StrayScanner recording
+
+The first time this deployment has been used for what it is for. Earlier phases proved the
+services start and are wired correctly; this proves a map can be built and queried.
+
+Input: a real 2143-frame handheld recording, 120 MB — `rgb.mp4`, 2143 depth frames, 2143
+confidence frames, odometry, IMU and camera matrix. Run on `g4dn.2xlarge` in `us-east-1d`
+with no domain, everything addressed by the host's private IP.
+
+### Mapping: 195.7 s
+
+| stage | status | time |
+|---|---|---|
+| upload (through the real API) | Completed | 0.2 s |
+| extract | Completed | 1.3 s |
+| thumbnail | Completed | 0.8 s |
+| `stray_to_colmap` | Completed | 22.5 s |
+| image filter | Completed | 0.6 s |
+| **hloc map build** | Completed | **166.0 s** |
+| PLY export | Completed | 0.2 s |
+| zip export | Completed | 3.9 s |
+| **total** | | **195.7 s** |
+
+```
+2143 raw frames -> 82 registered images
+num_points3D              14,858
+num_observations          85,288
+mean_track_length           5.74
+mean_reprojection_error     1.22 px
+```
+
+Roughly **$0.05 of instance time per map**.
+
+### Localization: 0.5 cm mean error, ~3 s per query
+
+Each returned GeoPose was compared against the reconstruction's own pose for that frame, put
+through the same map→ENU→geodetic chain the server uses.
+
+| frame | latency | error |
+|---|---|---|
+| frame_0633 | 2.42 s | 0.3 cm |
+| frame_1067 | 3.94 s | 0.4 cm |
+| frame_1680 | 2.95 s | 0.9 cm |
+
+**What this does and does not show.** The query images came from the map, so it is a
+self-consistency check. It exercises the whole chain — JPEG decode, SuperPoint, NetVLAD
+retrieval, SuperGlue matching, PnP, the graphics→ENU rotation and geodetic conversion — and
+proves each link works. It is **not** a generalisation test: a second recording of the same
+space, from novel viewpoints, is what would give an honest accuracy figure.
+
+Also observed: the response's `accuracy.position` and `accuracy.orientation` come back as
+`DBL_MAX`. The server does not populate them.
+
+### This corrects the earlier sizing warning
+
+An earlier section here argued the T4's ~76 % slower SuperGlue matching would "become real
+minutes" on a real scan, reasoning that a 500-frame scan does ~50× the matching of the
+10-image `sacre_coeur` test. **That was wrong, and in the direction that matters.**
+
+`colmap_model_filter_images.py` drops frames closer than 10 cm / 5° from the previous one,
+which took this 2143-frame recording down to **82 images**. Raw frame count does not drive
+the workload; the pose filter does, and it is bounded by how much *ground* was covered rather
+than how long the recording is. A 195-second map on the cheaper, more available GPU settles
+`g4dn.2xlarge` as the right default.
+
+### Four things that block a first-time user
+
+**1. FusionAuth 1.50+ makes login impossible.** Upstream hardcodes `offline_access` in the
+requested scope. FusionAuth 1.50 introduced scope consent, so every login redirects to
+`/oauth2/consent` — and that page returns HTTP 500 ("There is a problem with the server
+configuration"). Tried and rejected: `consentMode=NeverPrompt`, `scopeHandlingPolicy=Compatibility`,
+`unknownScopePolicy=Allow`, `relationship=FirstParty`, and adding `offline_access` to
+`providedScopePolicy` (rejected outright — only the standard OIDC scopes are accepted).
+Pinning **1.49.2**, the last release before consent, fixed it with no consent step at all.
+
+The failure mode is nasty: FusionAuth is healthy, kickstart succeeds, discovery is correct,
+and every check passes. It only breaks when a human tries to sign in.
+
+**2. The OAuth client secret must be alphanumeric.** With client id and secret byte-identical
+on both sides, the token exchange still failed:
+
+```
+invalid_client — Invalid client authentication credentials.
+```
+
+The secret was `base64(33 bytes)` and contained `+` and `/`. Auth.js authenticates with
+`client_secret_basic`; those characters break it against FusionAuth. Regenerating as 48
+alphanumeric characters made login work immediately. Nothing in the error points at the
+character set, and the natural debugging instinct — compare the two values — actively
+misleads, because they match.
+
+**3. The upload must keep the zip's original filename.** `stray_zip_extract.py` derives the
+directory it expects inside the archive from the filename stem, so `c041e1cfc2.zip` must
+still be named that. Uploading it as `scan.zip` fails with
+`No such file or directory: /tmp/tmpXXXX/scan`.
+
+**4. A map cannot be served until it has a georeference.** `load_map` requires
+`transform.json` beside the reconstruction and returns `Failed to load map transform <id>`
+without one. MapAligner normally writes it; it can also be POSTed to
+`/maps/{id}/hloc/{mapId}/transform` as `{latitude, longitude, height, matrix}`.
+
+### And one bug in this deployment, found only because a real login was attempted
+
+The no-domain fallback set `AUTH_FUSIONAUTH_ISSUER=http://localhost:9011`. Auth.js exchanges
+the authorization code for tokens **server-side**, so the backend container has to reach the
+issuer itself — and inside a container `localhost` is the container. FusionAuth also runs as
+a separate compose project, so it is not on the apps' network and not resolvable by service
+name either. No-domain mode now resolves the host's private IP from IMDS, which works from
+the containers, from the host, and from a browser inside the VPC.
+
+Every earlier phase passed with this broken, because nothing before this test ever completed
+a login.
+
+### Keeping maps between sessions: snapshot, do not keep the volume
+
+Worth stating plainly because the cost difference is large and the retained volume is easy
+to forget about.
+
+A stopped instance costs nothing for compute; you pay only for storage, at $0.08/GB-month
+for gp3. So between sessions:
+
+| | monthly |
+|---|---|
+| Terminate everything | $0 |
+| Snapshot the maps volume, delete the volume | ~$0.05 for a couple of maps |
+| Keep the maps volume (200 GB default) | $16 |
+| Stop the instance, keep root + maps (200 + 200 GB) | $32 |
+
+Snapshots bill only used blocks after compression, so a 200 GB volume holding a gigabyte of
+maps costs cents rather than $16. The test volume here held one 2143-frame scan, one
+82-image reconstruction and FusionAuth's database in under 1 GB.
+
+Keeping the *root* volume is the only thing that avoids the 25-minute rebuild, and that is
+the expensive half of the $32. Whether that is worth $16/month depends on how often the host
+wakes — at daily use it plainly is, which is exactly what the idle-shutdown design assumes.

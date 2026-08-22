@@ -1,6 +1,21 @@
 # Working notes / briefs — not for the public repo
 directions/
 
+# Scan data. Recordings are large and are personal data: StrayScanner captures
+# are video and depth of real places, often someone's home or workplace.
+# Never commit them to a public repo.
+scans/
+*.zip
+*.mp4
+*.r3d
+StrayScanner*/
+**/rgb.mp4
+**/depth/
+**/confidence/
+odometry.csv
+imu.csv
+camera_matrix.csv
+
 # Secrets & credentials — never commit
 .env
 .env.*
