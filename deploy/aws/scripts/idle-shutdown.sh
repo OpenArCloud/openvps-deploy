@@ -21,6 +21,19 @@
 #      including FusionAuth on 9011 — a login in flight is activity.
 #   3. No non-loopback request in any service's access log within the window.
 #   4. No backend job directory has been written recently.
+#   5. No recent touch of HEARTBEAT_FILE.
+#
+# EXTRA_PORTS, EXTRA_CONTAINERS and HEARTBEAT_FILE come from idle.conf and are how a
+# deployment variant extends checks 2, 3 and 5 without forking this script. The spatialdds
+# variant adds the web bridge's port and container, so a browser holding a WebSocket reads
+# as activity.
+#
+# Check 5 exists because DDS is invisible to checks 1-4. RTPS is UDP, so a native DDS client
+# never appears in check 2; it writes no HTTP access log, so never in check 3; and at the
+# 0.1-1 Hz a VPS is queried at, check 1 samples an instant where the GPU is usually between
+# requests. Without a heartbeat the host would stop under an actively-connected DDS client.
+# The localizer is what writes the file; until it does, this check is inert and the gap is
+# real — see the deployment README.
 #
 # On (3): container healthchecks hit these services every 10 seconds and land in the same
 # access logs, so loopback is filtered out — without that the instance would never look idle
@@ -43,6 +56,9 @@ CONF=/opt/openvps/idle.conf
 [ -r "$CONF" ] && . "$CONF"
 IDLE_MINUTES="${IDLE_MINUTES:-30}"
 MAPS_DIR="${MAPS_DIR:-/home/ubuntu/data/maps}"
+EXTRA_PORTS="${EXTRA_PORTS:-}"
+EXTRA_CONTAINERS="${EXTRA_CONTAINERS:-}"
+HEARTBEAT_FILE="${HEARTBEAT_FILE:-}"
 STATE_DIR=/var/lib/openvps
 STATE="$STATE_DIR/last-activity"
 mkdir -p "$STATE_DIR"
@@ -66,9 +82,11 @@ gpu_procs="$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/nu
 
 # 2. Established connections to the service ports, excluding loopback ----------------
 if [ -z "$reason" ]; then
+  ports='80|3001|8000|9011'
+  for extra in $EXTRA_PORTS; do ports="$ports|$extra"; done
   conns=$(ss -Htn state established 2>/dev/null \
           | awk '{print $3, $4}' \
-          | grep -E ':(80|3001|8000|9011)\s' \
+          | grep -E ":($ports)\s" \
           | grep -vc '127\.0\.0\.1' || true)
   conns=${conns:-0}
   [ "$conns" -gt 0 ] && reason="conns:${conns}"
@@ -78,7 +96,7 @@ fi
 # `docker logs --since` is used rather than reading files, so this works regardless of
 # where each image sends its log.
 if [ -z "$reason" ]; then
-  for c in openvps-frontend-1 openvps-mapaligner-1 openvps-maplocalizer-1 openvps-auth-fusionauth-1; do
+  for c in openvps-frontend-1 openvps-mapaligner-1 openvps-maplocalizer-1 openvps-auth-fusionauth-1 $EXTRA_CONTAINERS; do
     docker inspect "$c" >/dev/null 2>&1 || continue
     hits=$(docker logs --since "${IDLE_MINUTES}m" "$c" 2>&1 \
            | grep -v '127\.0\.0\.1' \
@@ -94,6 +112,14 @@ fi
 if [ -z "$reason" ] && [ -d "$MAPS_DIR" ]; then
   recent=$(find "$MAPS_DIR" -mmin "-${IDLE_MINUTES}" -type f -print -quit 2>/dev/null)
   [ -n "$recent" ] && reason="maps-write"
+fi
+
+# 5. DDS activity heartbeat ------------------------------------------------------------
+# Written by the localizer when it serves a request over DDS. See the header note: RTPS is
+# UDP and logs nothing, so this is the only signal a native DDS client leaves behind.
+if [ -z "$reason" ] && [ -n "$HEARTBEAT_FILE" ] && [ -f "$HEARTBEAT_FILE" ]; then
+  beat=$(find "$HEARTBEAT_FILE" -mmin "-${IDLE_MINUTES}" -print -quit 2>/dev/null)
+  [ -n "$beat" ] && reason="dds-heartbeat"
 fi
 
 if [ -n "$reason" ]; then

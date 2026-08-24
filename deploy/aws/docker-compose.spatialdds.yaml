@@ -1,0 +1,45 @@
+# Copyright 2026 Open AR Cloud
+# Licensed under the MIT License.
+# SPDX-License-Identifier: MIT
+#
+# Compose override for the spatialdds variant. Layered on top of upstream
+# docker-compose.yaml and docker-compose.aws.yaml, never instead of them, so the HLOC cache
+# volume, the healthchecks and the log rotation all still apply.
+#
+# The web bridge service is not here yet. It is vendored into openvps:spatialdds in Phase 3,
+# and Compose cannot reference a build context that does not exist. Everything around it is
+# already in place and inert: the 8088 security group rule, the idle detector's extra port
+# and container, the WebBridgeEndpoint output. The service block to paste in, and the one
+# environment variable that is easy to get wrong, are in the README under
+# "The spatialdds variant".
+
+name: openvps
+
+services:
+  # maplocalizer moves to host networking below, which takes it off the Compose bridge
+  # network — so `http://maplocalizer:8000`, which upstream sets for the backend, stops
+  # resolving and MapBuilder can no longer load a map. Reach it by the host gateway
+  # instead. This is the one thing host networking breaks, and it breaks quietly: the
+  # stack comes up healthy and only map loading fails.
+  backend:
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      - MAPLOCALIZER_URL=http://host.docker.internal:8000
+
+  maplocalizer:
+    # RTPS advertises the address it binds to. Under Docker's default bridge that is the
+    # container's private address, which no off-host peer can route to — so a two-instance
+    # deployment discovers participants and then silently exchanges nothing. Host networking
+    # avoids it, and binds 8000 on the host directly, which is the address the waker already
+    # reaches.
+    network_mode: host
+    volumes:
+      - /opt/openvps/cyclonedds.xml:/etc/cyclonedds.xml:ro
+      # The DDS activity heartbeat the idle detector reads. RTPS is UDP and writes no access
+      # log, so without this an actively connected DDS client cannot keep the host awake.
+      - /var/lib/openvps:/var/lib/openvps
+    environment:
+      - CYCLONEDDS_URI=file:///etc/cyclonedds.xml
+      - SPATIALDDS_DDS_DOMAIN=0
+      - OPENVPS_DDS_HEARTBEAT=/var/lib/openvps/last-dds-activity

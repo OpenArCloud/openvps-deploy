@@ -125,6 +125,63 @@ Useful parameters: `InstanceType`, `RootVolumeSize` (200, and 150 is the practic
 `MapsVolumeSize`, `IdleShutdownMinutes` (30, or 0 to disable), `AttachElasticIp` (off, since
 the waker reaches the host by private IP).
 
+## Variants
+
+`Variant` chooses which OpenVPS is deployed. Everything else — instance sizing, storage,
+idle shutdown, the waker, the secret — is shared.
+
+| | `geopose` (default) | `spatialdds` |
+|---|---|---|
+| Upstream | `openvps:main` | `openvps:spatialdds` |
+| Protocol | OSCP GeoPose Protocol over HTTP | SpatialDDS 1.7 VPS binding over DDS, plus the HTTP endpoint |
+| Extra ports | — | 8088 from the waker; RTPS 7400–7500 between hosts in the group |
+
+```sh
+aws cloudformation create-stack --stack-name openvps-spatialdds \
+  --template-body file://template.yaml \
+  --capabilities CAPABILITY_IAM \
+  --parameters ParameterKey=Variant,ParameterValue=spatialdds \
+               ParameterKey=VpcId,ParameterValue=vpc-xxxx \
+               ...
+```
+
+Both variants pin an explicit commit, in the `VariantConfig` mapping in
+`template.src.yaml`. Neither tracks a branch: a branch would let two deployments of the
+same stack run different software with nothing recording the difference. `UpstreamRef`
+overrides the pin for a one-off test and is empty by default.
+
+`Variant` cannot usefully be changed on an existing stack — the clone happens once, on
+first boot, and user-data does not re-run. Deploy a second stack.
+
+### The spatialdds variant
+
+`maplocalizer` runs with `network_mode: host`, because RTPS advertises the address it binds
+to and a container address is not routable from another host. One consequence to know: that
+takes it off the Compose bridge network, so `http://maplocalizer:8000` stops resolving. The
+override repoints the backend at `host.docker.internal`; any other service that reaches
+`maplocalizer` by name needs the same.
+
+A VPC carries no multicast, so `cyclonedds.xml` disables it and discovers against an
+explicit peer list. Empty is right for one host. For two, pass the other's private IP:
+
+```sh
+ParameterKey=DdsPeers,ParameterValue='udp/10.0.1.42'
+```
+
+The web bridge is not deployed yet — it is vendored into the branch in a later phase. The
+pieces around it are already in place and inert: the 8088 ingress rule, the idle detector's
+extra port and container, and the `WebBridgeEndpoint` output. When it lands it needs a
+waker route:
+
+```
+vps-bridge.<domain> {
+    reverse_proxy <private-ip>:8088
+}
+```
+
+Caddy proxies WebSockets natively. There is no waker in this repository yet, only its
+security group — so that route has nowhere to go until one exists.
+
 ## Getting at it
 
 No SSH, no key pair.
@@ -154,6 +211,16 @@ without it the instance would shut down mid-reconstruction.
 
 The instance is stopped, not terminated, so the root volume keeps the built images and the
 HLOC cache and a wake skips the 25-minute build.
+
+The detector is shared by both variants and extended, not replaced, by `EXTRA_PORTS`,
+`EXTRA_CONTAINERS` and `HEARTBEAT_FILE` in `idle.conf`. The `spatialdds` variant adds the
+web bridge's port and container, so a browser holding a WebSocket counts as activity.
+
+A native DDS client is invisible to the four checks above: RTPS is UDP so it never shows as
+an established TCP connection, it writes no HTTP log, and the GPU check samples an instant
+between requests. `HEARTBEAT_FILE` is the fifth check — the localizer touches it when it
+serves a DDS request. Until the localizer writes it, the check is inert and an idle-looking
+host can stop under a connected DDS client.
 
 ```sh
 sudo sed -i 's/^IDLE_MINUTES=.*/IDLE_MINUTES=60/' /opt/openvps/idle.conf

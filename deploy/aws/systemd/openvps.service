@@ -9,9 +9,14 @@ Wants=network-online.target openvps-auth.service
 Type=oneshot
 RemainAfterExit=yes
 WorkingDirectory=/opt/openvps/openvps
+# COMPOSE_FILES holds the -f flags for this deployment's variant, written by user-data.
+# Unquoted $COMPOSE_FILES is word-split by systemd, which is what turns one value back into
+# a flag list — so the unit stays identical across variants and the variant lives in one
+# place. ${COMPOSE_FILES} (braced) would NOT split, and the command would fail.
+EnvironmentFile=/opt/openvps/compose.conf
 ExecStartPre=/usr/local/bin/openvps-render-env
-ExecStart=/usr/bin/docker compose -f docker-compose.yaml -f /opt/openvps/docker-compose.aws.yaml --env-file /opt/openvps/docker.env up -d --wait --wait-timeout 600
-ExecStop=/usr/bin/docker compose -f docker-compose.yaml -f /opt/openvps/docker-compose.aws.yaml --env-file /opt/openvps/docker.env stop
+ExecStart=/usr/bin/docker compose $COMPOSE_FILES --env-file /opt/openvps/docker.env up -d --wait --wait-timeout 600
+ExecStop=/usr/bin/docker compose $COMPOSE_FILES --env-file /opt/openvps/docker.env stop
 TimeoutStartSec=900
 
 [Install]

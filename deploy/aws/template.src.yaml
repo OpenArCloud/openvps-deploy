@@ -8,6 +8,8 @@ Description: >-
 Metadata:
   AWS::CloudFormation::Interface:
     ParameterGroups:
+      - Label: {default: Variant}
+        Parameters: [Variant, DdsPeers]
       - Label: {default: Placement}
         Parameters: [VpcId, SubnetId]
       - Label: {default: Instance}
@@ -18,8 +20,30 @@ Metadata:
         Parameters: [UpstreamRepo, UpstreamRef, HlocRepo, HlocCommit]
     ParameterLabels:
       SubnetId: {default: 'Public subnet (also fixes the AZ for the maps volume, permanently)'}
+      Variant: {default: 'Which OpenVPS to deploy (geopose is the default and is unchanged)'}
 
 Parameters:
+
+  Variant:
+    Type: String
+    Default: geopose
+    AllowedValues: [geopose, spatialdds]
+    Description: >-
+      Which OpenVPS to deploy. `geopose` is the GeoPose Protocol service on openvps:main and
+      is exactly what this template deployed before the variant existed. `spatialdds` is the
+      SpatialDDS 1.7 VPS binding on the openvps:spatialdds branch, and additionally runs the
+      SpatialDDS web bridge. The variant chooses the upstream ref and the Compose overrides;
+      instance sizing, storage, idle shutdown and the waker are shared. Refs are pinned per
+      variant in the VariantConfig mapping — neither variant tracks a moving branch.
+
+  DdsPeers:
+    Type: String
+    Default: ''
+    Description: >-
+      spatialdds only, and optional. Space-separated unicast DDS peer addresses, e.g.
+      `udp/10.0.1.42`. A VPC does not carry multicast, so RTPS peer discovery across two
+      instances has to be unicast; leave empty for a single-host deployment, where discovery
+      over loopback works without peers. Ignored by the geopose variant.
 
   VpcId:
     Type: AWS::EC2::VPC::Id
@@ -123,8 +147,11 @@ Parameters:
     Default: https://github.com/OpenArCloud/openvps.git
   UpstreamRef:
     Type: String
-    Default: fc2f4706f8cd0340b22685aa67c4a9d63837f3f6
-    Description: Upstream commit verified in Phase 1. Pin it; do not track a branch.
+    Default: ''
+    Description: >-
+      Override the variant's pinned upstream commit. Leave empty — the normal case — and the
+      ref comes from the VariantConfig mapping below, which pins each variant to a verified
+      commit. Set it only to test a specific commit, and pin it; do not name a branch.
   HlocRepo:
     Type: String
     Default: https://github.com/cvg/Hierarchical-Localization.git
@@ -140,9 +167,37 @@ Parameters:
     Default: /aws/service/deeplearning/ami/x86_64/base-oss-nvidia-driver-gpu-ubuntu-22.04/latest/ami-id
     Description: Resolved from the SSM public parameter rather than hardcoded.
 
+Mappings:
+
+  # Everything that differs between the two variants, in one table. Adding a variant means
+  # adding a row here plus a Compose override file; nothing else in the template branches on
+  # the variant name.
+  #
+  # Refs are commit hashes, never branch names. A branch would make two deployments of the
+  # "same" stack produce different software with no record of the difference.
+  VariantConfig:
+    geopose:
+      # openvps:main. Unchanged from before the variant existed, so a stack created with
+      # defaults today is byte-identical to one created before.
+      UpstreamRef: fc2f4706f8cd0340b22685aa67c4a9d63837f3f6
+      ComposeFiles: '-f docker-compose.yaml -f /opt/openvps/docker-compose.aws.yaml'
+      IdleExtraPorts: ''
+      IdleExtraContainers: ''
+    spatialdds:
+      # openvps:spatialdds. The branch currently carries no implementation, so this is the
+      # same commit as geopose and the two variants differ only by the Compose override.
+      # Bump it with each branch checkpoint that changes what runs.
+      UpstreamRef: fc2f4706f8cd0340b22685aa67c4a9d63837f3f6
+      ComposeFiles: '-f docker-compose.yaml -f /opt/openvps/docker-compose.aws.yaml -f /opt/openvps/docker-compose.spatialdds.yaml'
+      # The web bridge's WebSocket port, so a connected browser client counts as activity.
+      IdleExtraPorts: '8088'
+      IdleExtraContainers: 'openvps-webbridge-1'
+
 Conditions:
   WantElasticIp: !Equals [!Ref AttachElasticIp, 'true']
   HasDomain: !Not [!Equals [!Ref DomainName, '']]
+  IsSpatialDds: !Equals [!Ref Variant, 'spatialdds']
+  HasUpstreamRefOverride: !Not [!Equals [!Ref UpstreamRef, '']]
 
 Resources:
 
@@ -214,6 +269,45 @@ Resources:
       ToPort: 8000
       SourceSecurityGroupId: !Ref WakerSecurityGroup
       Description: MapLocalizer, from the waker only
+
+  # --- spatialdds variant only ---------------------------------------------------------
+
+  GpuIngressWebBridge:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: IsSpatialDds
+    Properties:
+      GroupId: !Ref GpuSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8088
+      ToPort: 8088
+      SourceSecurityGroupId: !Ref WakerSecurityGroup
+      Description: SpatialDDS web bridge (HTTP + WebSocket), from the waker only
+
+  # RTPS between GPU hosts, for the two-instance discovery test. Source is this group
+  # itself, so it covers any instance in it and nothing outside the VPC. UDP 7400-7500 is
+  # Cyclone's default port range; TCP is here because a VPC carries no multicast, so a
+  # deployment that cannot use unicast UDP peers falls back to Cyclone's TCP transport.
+  GpuIngressRtpsUdp:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: IsSpatialDds
+    Properties:
+      GroupId: !Ref GpuSecurityGroup
+      IpProtocol: udp
+      FromPort: 7400
+      ToPort: 7500
+      SourceSecurityGroupId: !Ref GpuSecurityGroup
+      Description: RTPS discovery and user traffic, between hosts in this group only
+
+  GpuIngressRtpsTcp:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: IsSpatialDds
+    Properties:
+      GroupId: !Ref GpuSecurityGroup
+      IpProtocol: tcp
+      FromPort: 7400
+      ToPort: 7500
+      SourceSecurityGroupId: !Ref GpuSecurityGroup
+      Description: RTPS over TCP, between hosts in this group only
 
   # ------------------------------------------------------------------ identity
 
@@ -353,224 +447,272 @@ Resources:
         - {Key: Project, Value: openvps-aws}
         - {Key: Name, Value: !Sub '${AWS::StackName}-gpu'}
       UserData:
-        Fn::Base64: !Sub |
-          #!/bin/bash
-          # First-boot provisioning. Runs once; the systemd unit it installs is what brings
-          # the stack up on every subsequent boot.
-          set -uo pipefail
-          exec > >(tee -a /var/log/openvps-bootstrap.log) 2>&1
-          echo "=== openvps bootstrap $(date -u) ==="
+        Fn::Base64:
+          # Two-argument Fn::Sub: the second argument supplies the variant-derived values,
+          # which Mappings cannot reach through the short form. ${!Var} still escapes a
+          # literal shell variable exactly as before.
+          Fn::Sub:
+            - |
+              #!/bin/bash
+              # First-boot provisioning. Runs once; the systemd unit it installs is what brings
+              # the stack up on every subsequent boot.
+              set -uo pipefail
+              exec > >(tee -a /var/log/openvps-bootstrap.log) 2>&1
+              echo "=== openvps bootstrap $(date -u) ==="
 
-          STACK='${AWS::StackName}'
-          REGION='${AWS::Region}'
-          SECRET_ARN='${SecretsManagerArn}'
-          UPSTREAM_REPO='${UpstreamRepo}'
-          UPSTREAM_REF='${UpstreamRef}'
-          HLOC_REPO='${HlocRepo}'
-          HLOC_COMMIT='${HlocCommit}'
-          DOMAIN='${DomainName}'
-          DEF_LON='${DefaultLongitude}'
-          DEF_LAT='${DefaultLatitude}'
-          LOG_GROUP='${LogGroup}'
-          WAIT_URL='${BootstrapWaitHandle}'
-          IDLE_MIN='${IdleShutdownMinutes}'
+              STACK='${AWS::StackName}'
+              REGION='${AWS::Region}'
+              SECRET_ARN='${SecretsManagerArn}'
+              UPSTREAM_REPO='${UpstreamRepo}'
+              UPSTREAM_REF='${EffectiveUpstreamRef}'
+              HLOC_REPO='${HlocRepo}'
+              HLOC_COMMIT='${HlocCommit}'
+              DOMAIN='${DomainName}'
+              DEF_LON='${DefaultLongitude}'
+              DEF_LAT='${DefaultLatitude}'
+              LOG_GROUP='${LogGroup}'
+              WAIT_URL='${BootstrapWaitHandle}'
+              IDLE_MIN='${IdleShutdownMinutes}'
+              VARIANT='${Variant}'
+              COMPOSE_FILES='${ComposeFiles}'
+              IDLE_EXTRA_PORTS='${IdleExtraPorts}'
+              IDLE_EXTRA_CONTAINERS='${IdleExtraContainers}'
+              DDS_PEERS='${DdsPeers}'
 
-          DATA_DIR=/home/ubuntu/data
-          MAPS_DIR=/home/ubuntu/data/maps
-          FA_DB_DIR=/home/ubuntu/data/fusionauth-db
-          BASE=/opt/openvps
+              DATA_DIR=/home/ubuntu/data
+              MAPS_DIR=/home/ubuntu/data/maps
+              FA_DB_DIR=/home/ubuntu/data/fusionauth-db
+              BASE=/opt/openvps
 
-          TOKEN="$(curl -sf -X PUT http://169.254.169.254/latest/api/token \
-                   -H 'X-aws-ec2-metadata-token-ttl-seconds: 300' || true)"
-          IID="$(curl -sf -H "X-aws-ec2-metadata-token: ${!TOKEN}" \
-                 http://169.254.169.254/latest/meta-data/instance-id || hostname)"
+              TOKEN="$(curl -sf -X PUT http://169.254.169.254/latest/api/token \
+                       -H 'X-aws-ec2-metadata-token-ttl-seconds: 300' || true)"
+              IID="$(curl -sf -H "X-aws-ec2-metadata-token: ${!TOKEN}" \
+                     http://169.254.169.254/latest/meta-data/instance-id || hostname)"
 
-          signal() {
-            curl -sS -X PUT -H 'Content-Type:' --max-time 30 \
-              --data-binary "{\"Status\":\"$1\",\"Reason\":\"$2\",\"UniqueId\":\"${!IID}\",\"Data\":\"$2\"}" \
-              "${!WAIT_URL}" || true
-          }
-          # Signal FAILURE immediately rather than letting CreationPolicy burn its full
-          # 50-minute timeout on a problem we already know about.
-          fail() { echo "BOOTSTRAP FAILED: $*"; signal FAILURE "$*"; exit 1; }
+              signal() {
+                curl -sS -X PUT -H 'Content-Type:' --max-time 30 \
+                  --data-binary "{\"Status\":\"$1\",\"Reason\":\"$2\",\"UniqueId\":\"${!IID}\",\"Data\":\"$2\"}" \
+                  "${!WAIT_URL}" || true
+              }
+              # Signal FAILURE immediately rather than letting CreationPolicy burn its full
+              # 50-minute timeout on a problem we already know about.
+              fail() { echo "BOOTSTRAP FAILED: $*"; signal FAILURE "$*"; exit 1; }
 
-          # ---- fail fast on no egress --------------------------------------------------
-          # Everything below needs the internet: git clones, base images, pip, apt. There
-          # is deliberately no NAT gateway, so this subnet must be public with
-          # auto-assign public IPv4 enabled. Catch it in seconds, not in 50 minutes.
-          NET_OK=""
-          for _ in $(seq 1 18); do
-            if curl -sS --max-time 10 -o /dev/null https://github.com 2>/dev/null; then NET_OK=1; break; fi
-            sleep 5
-          done
-          if [ -z "${!NET_OK}" ]; then
-            echo "--- network diagnostics ---"
-            ip -br addr; ip route; cat /etc/resolv.conf
-            getent hosts github.com || echo "DNS lookup failed"
-            fail "no outbound internet after 90s - is this subnet public with auto-assign public IPv4 on?"
-          fi
-          echo "egress OK"
+              # ---- fail fast on no egress --------------------------------------------------
+              # Everything below needs the internet: git clones, base images, pip, apt. There
+              # is deliberately no NAT gateway, so this subnet must be public with
+              # auto-assign public IPv4 enabled. Catch it in seconds, not in 50 minutes.
+              NET_OK=""
+              for _ in $(seq 1 18); do
+                if curl -sS --max-time 10 -o /dev/null https://github.com 2>/dev/null; then NET_OK=1; break; fi
+                sleep 5
+              done
+              if [ -z "${!NET_OK}" ]; then
+                echo "--- network diagnostics ---"
+                ip -br addr; ip route; cat /etc/resolv.conf
+                getent hosts github.com || echo "DNS lookup failed"
+                fail "no outbound internet after 90s - is this subnet public with auto-assign public IPv4 on?"
+              fi
+              echo "egress OK"
 
-          # ---- data volume ------------------------------------------------------------
-          # Device names are not stable on Nitro: /dev/sdf shows up as /dev/nvmeXn1 with an
-          # unpredictable index. Identify it as "the whole disk that is not the root disk"
-          # — safe because exactly one extra volume is ever attached. Matching on the NVMe
-          # serial (which carries the EBS volume id) would be tighter, but referencing
-          # MapsVolume here would create a cycle: user-data -> volume -> instance AZ.
-          ROOT_PART="$(findmnt -no SOURCE /)"
-          ROOT_NAME="$(lsblk -no PKNAME "${!ROOT_PART}" 2>/dev/null || basename "${!ROOT_PART}")"
-          echo "root disk is /dev/${!ROOT_NAME}"
-          DEV=""
-          for _ in $(seq 1 60); do
-            # EBS volumes report an NVMe serial of the form "vol0123abc..."; instance-store
-            # disks do not. Filtering on that prefix is what keeps us off the ephemeral
-            # disk — every g6 ships one (250 GB on xlarge, 450 GB on 2xlarge), and it is
-            # wiped on every stop/start, so formatting it would silently destroy the maps.
-            while read -r name serial type; do
-              [ "${!type}" = "disk" ] || continue
-              [ "${!name}" = "${!ROOT_NAME}" ] && continue
-              case "${!serial}" in vol*) DEV="/dev/${!name}" ;; esac
-            done < <(lsblk -dn -o NAME,SERIAL,TYPE)
-            [ -n "${!DEV}" ] && break
-            sleep 5
-          done
-          if [ -z "${!DEV}" ]; then
-            echo "--- block devices seen ---"; lsblk -o NAME,SERIAL,TYPE,SIZE,MOUNTPOINT
-            fail "maps EBS volume never appeared as a block device"
-          fi
-          echo "maps volume is ${!DEV}"
+              # ---- data volume ------------------------------------------------------------
+              # Device names are not stable on Nitro: /dev/sdf shows up as /dev/nvmeXn1 with an
+              # unpredictable index. Identify it as "the whole disk that is not the root disk"
+              # — safe because exactly one extra volume is ever attached. Matching on the NVMe
+              # serial (which carries the EBS volume id) would be tighter, but referencing
+              # MapsVolume here would create a cycle: user-data -> volume -> instance AZ.
+              ROOT_PART="$(findmnt -no SOURCE /)"
+              ROOT_NAME="$(lsblk -no PKNAME "${!ROOT_PART}" 2>/dev/null || basename "${!ROOT_PART}")"
+              echo "root disk is /dev/${!ROOT_NAME}"
+              DEV=""
+              for _ in $(seq 1 60); do
+                # EBS volumes report an NVMe serial of the form "vol0123abc..."; instance-store
+                # disks do not. Filtering on that prefix is what keeps us off the ephemeral
+                # disk — every g6 ships one (250 GB on xlarge, 450 GB on 2xlarge), and it is
+                # wiped on every stop/start, so formatting it would silently destroy the maps.
+                while read -r name serial type; do
+                  [ "${!type}" = "disk" ] || continue
+                  [ "${!name}" = "${!ROOT_NAME}" ] && continue
+                  case "${!serial}" in vol*) DEV="/dev/${!name}" ;; esac
+                done < <(lsblk -dn -o NAME,SERIAL,TYPE)
+                [ -n "${!DEV}" ] && break
+                sleep 5
+              done
+              if [ -z "${!DEV}" ]; then
+                echo "--- block devices seen ---"; lsblk -o NAME,SERIAL,TYPE,SIZE,MOUNTPOINT
+                fail "maps EBS volume never appeared as a block device"
+              fi
+              echo "maps volume is ${!DEV}"
 
-          if ! blkid "${!DEV}" >/dev/null 2>&1; then
-            echo "no filesystem on ${!DEV}; creating ext4"
-            mkfs.ext4 -L openvps-maps "${!DEV}" || fail "mkfs failed"
-          else
-            echo "existing filesystem found; leaving it alone"
-          fi
+              if ! blkid "${!DEV}" >/dev/null 2>&1; then
+                echo "no filesystem on ${!DEV}; creating ext4"
+                mkfs.ext4 -L openvps-maps "${!DEV}" || fail "mkfs failed"
+              else
+                echo "existing filesystem found; leaving it alone"
+              fi
 
-          UUID="$(blkid -s UUID -o value "${!DEV}")"
-          [ -n "${!UUID}" ] || fail "could not read UUID"
-          mkdir -p "${!DATA_DIR}"
-          # The volume is mounted at /home/ubuntu/data, not directly at the maps directory,
-          # so FusionAuth's Postgres can live beside the maps on the same RETAINED volume.
-          # That database holds every user account and the OAuth client secret the apps
-          # authenticate with; it has to outlive the instance exactly as the maps do.
-          # Mount by UUID — device names are not stable across reboots, observed changing
-          # from nvme2n1 to nvme1n1 on the first stop/start. nofail so a missing volume
-          # degrades to a failed service rather than an unbootable host.
-          grep -q "${!UUID}" /etc/fstab || \
-            echo "UUID=${!UUID} ${!DATA_DIR} ext4 defaults,nofail,x-systemd.device-timeout=30 0 2" >> /etc/fstab
-          systemctl daemon-reload
-          mount -a || fail "mount failed"
-          mkdir -p "${!MAPS_DIR}" "${!FA_DB_DIR}"
-          # The backend runs as uid 1000 inside its container (MY_USER_ID).
-          chown 1000:1000 "${!MAPS_DIR}"
-          # Postgres runs as uid 70 (alpine). The directory must be owned by that uid BEFORE
-          # the container first starts — left root-owned, the entrypoint cannot create its
-          # PGDATA subdirectory and the container enters a restart loop that survives fixing
-          # the ownership afterwards, because a half-made pgdata is left behind.
-          chown 70:70 "${!FA_DB_DIR}"
-          chmod 700 "${!FA_DB_DIR}"
-          df -h "${!DATA_DIR}"
+              UUID="$(blkid -s UUID -o value "${!DEV}")"
+              [ -n "${!UUID}" ] || fail "could not read UUID"
+              mkdir -p "${!DATA_DIR}"
+              # The volume is mounted at /home/ubuntu/data, not directly at the maps directory,
+              # so FusionAuth's Postgres can live beside the maps on the same RETAINED volume.
+              # That database holds every user account and the OAuth client secret the apps
+              # authenticate with; it has to outlive the instance exactly as the maps do.
+              # Mount by UUID — device names are not stable across reboots, observed changing
+              # from nvme2n1 to nvme1n1 on the first stop/start. nofail so a missing volume
+              # degrades to a failed service rather than an unbootable host.
+              grep -q "${!UUID}" /etc/fstab || \
+                echo "UUID=${!UUID} ${!DATA_DIR} ext4 defaults,nofail,x-systemd.device-timeout=30 0 2" >> /etc/fstab
+              systemctl daemon-reload
+              mount -a || fail "mount failed"
+              mkdir -p "${!MAPS_DIR}" "${!FA_DB_DIR}"
+              # The backend runs as uid 1000 inside its container (MY_USER_ID).
+              chown 1000:1000 "${!MAPS_DIR}"
+              # Postgres runs as uid 70 (alpine). The directory must be owned by that uid BEFORE
+              # the container first starts — left root-owned, the entrypoint cannot create its
+              # PGDATA subdirectory and the container enters a restart loop that survives fixing
+              # the ownership afterwards, because a half-made pgdata is left behind.
+              chown 70:70 "${!FA_DB_DIR}"
+              chmod 700 "${!FA_DB_DIR}"
+              df -h "${!DATA_DIR}"
 
-          # ---- source ------------------------------------------------------------------
-          mkdir -p "${!BASE}/nginx"
-          if [ ! -d "${!BASE}/openvps/.git" ]; then
-            git clone "${!UPSTREAM_REPO}" "${!BASE}/openvps" || fail "clone upstream failed"
-            git -C "${!BASE}/openvps" checkout "${!UPSTREAM_REF}" || fail "checkout upstream failed"
-            git clone "${!HLOC_REPO}" "${!BASE}/openvps/Hierarchical-Localization" || fail "clone hloc failed"
-            git -C "${!BASE}/openvps/Hierarchical-Localization" checkout "${!HLOC_COMMIT}" || fail "checkout hloc failed"
-            git -C "${!BASE}/openvps/Hierarchical-Localization" submodule update --init --recursive || fail "hloc submodules failed"
-          fi
+              # ---- source ------------------------------------------------------------------
+              mkdir -p "${!BASE}/nginx"
+              if [ ! -d "${!BASE}/openvps/.git" ]; then
+                git clone "${!UPSTREAM_REPO}" "${!BASE}/openvps" || fail "clone upstream failed"
+                git -C "${!BASE}/openvps" checkout "${!UPSTREAM_REF}" || fail "checkout upstream failed"
+                git clone "${!HLOC_REPO}" "${!BASE}/openvps/Hierarchical-Localization" || fail "clone hloc failed"
+                git -C "${!BASE}/openvps/Hierarchical-Localization" checkout "${!HLOC_COMMIT}" || fail "checkout hloc failed"
+                git -C "${!BASE}/openvps/Hierarchical-Localization" submodule update --init --recursive || fail "hloc submodules failed"
+              fi
 
-          # ---- AWS-specific config -----------------------------------------------------
-          # Config files, scripts and unit files come from this stack's own Metadata rather
-          # than being inlined here. User-data is capped at 16 KB and embedding them all
-          # blew through it; Metadata rides in the template, which allows 51 KB. It also
-          # means the payloads need no Fn::Sub escaping and stay byte-identical to the
-          # readable copies under deploy/aws/ in this repository.
-          aws cloudformation describe-stack-resource --region "${!REGION}" \
-            --stack-name "${!STACK}" --logical-resource-id Instance \
-            --query 'StackResourceDetail.Metadata' --output text > /tmp/openvps-meta.json \
-            || fail "could not read stack metadata"
+              # ---- AWS-specific config -----------------------------------------------------
+              # Config files, scripts and unit files come from this stack's own Metadata rather
+              # than being inlined here. User-data is capped at 16 KB and embedding them all
+              # blew through it; Metadata rides in the template, which allows 51 KB. It also
+              # means the payloads need no Fn::Sub escaping and stay byte-identical to the
+              # readable copies under deploy/aws/ in this repository.
+              aws cloudformation describe-stack-resource --region "${!REGION}" \
+                --stack-name "${!STACK}" --logical-resource-id Instance \
+                --query 'StackResourceDetail.Metadata' --output text > /tmp/openvps-meta.json \
+                || fail "could not read stack metadata"
 
-          python3 - <<'WRITEFILES' || fail "writing config files failed"
-          import json, os, gzip, base64
-          meta = json.load(open('/tmp/openvps-meta.json'))
-          for path, spec in meta['openvps']['files'].items():
-              os.makedirs(os.path.dirname(path), exist_ok=True)
-              data = gzip.decompress(base64.b64decode(spec['gz64']))
-              with open(path, 'wb') as fh:
-                  fh.write(data)
-              os.chmod(path, int(spec['mode'], 8))
-              print(f"  wrote {path} ({len(data)} bytes, mode {spec['mode']})")
-          WRITEFILES
-          rm -f /tmp/openvps-meta.json
-          # Written here rather than fetched, so a first boot needs nothing but this repo's
-          # pinned upstream. Comments are stripped; the annotated originals live in
-          # deploy/aws/ in the deployment repo.
-
-
-          # ---- env renderer: runs on every boot, so rotated secrets are picked up -------
-
-          cat > "${!BASE}/bootstrap.conf" <<CONF
-          REGION=${!REGION}
-          SECRET_ARN=${!SECRET_ARN}
-          DOMAIN=${!DOMAIN}
-          DEF_LON=${!DEF_LON}
-          DEF_LAT=${!DEF_LAT}
-          CONF
-          chmod 600 "${!BASE}/bootstrap.conf"
-
-          # ---- systemd unit: brings the stack up on every boot -------------------------
-
-          systemctl daemon-reload
-          systemctl enable openvps-auth.service openvps.service
-
-          # ---- idle shutdown (Phase 3) --------------------------------------------------
-          cat > "${!BASE}/idle.conf" <<CONF
-          IDLE_MINUTES=${!IDLE_MIN}
-          MAPS_DIR=${!MAPS_DIR}
-          CONF
+              python3 - <<'WRITEFILES' || fail "writing config files failed"
+              import json, os, gzip, base64
+              meta = json.load(open('/tmp/openvps-meta.json'))
+              for path, spec in meta['openvps']['files'].items():
+                  os.makedirs(os.path.dirname(path), exist_ok=True)
+                  data = gzip.decompress(base64.b64decode(spec['gz64']))
+                  with open(path, 'wb') as fh:
+                      fh.write(data)
+                  os.chmod(path, int(spec['mode'], 8))
+                  print(f"  wrote {path} ({len(data)} bytes, mode {spec['mode']})")
+              WRITEFILES
+              rm -f /tmp/openvps-meta.json
+              # Written here rather than fetched, so a first boot needs nothing but this repo's
+              # pinned upstream. Comments are stripped; the annotated originals live in
+              # deploy/aws/ in the deployment repo.
 
 
+              # ---- env renderer: runs on every boot, so rotated secrets are picked up -------
 
-          systemctl daemon-reload
-          systemctl enable openvps-idle.timer
+              cat > "${!BASE}/bootstrap.conf" <<CONF
+              REGION=${!REGION}
+              SECRET_ARN=${!SECRET_ARN}
+              DOMAIN=${!DOMAIN}
+              DEF_LON=${!DEF_LON}
+              DEF_LAT=${!DEF_LAT}
+              CONF
+              chmod 600 "${!BASE}/bootstrap.conf"
 
-          # ---- build ------------------------------------------------------------------
-          /usr/local/bin/openvps-render-env || fail "rendering docker.env failed"
-          cd "${!BASE}/openvps" || fail "no source dir"
-          echo "=== build start $(date -u) ==="
-          docker compose -f docker-compose.yaml -f "${!BASE}/docker-compose.aws.yaml" \
-            --env-file "${!BASE}/docker.env" build || fail "docker compose build failed"
-          echo "=== build done $(date -u) ==="
+              # ---- variant ------------------------------------------------------------------
+              # The Compose file list lives in a conf file rather than being baked into the
+              # systemd unit, so the unit is one shared file across both variants and the
+              # variant is a single value in one place. systemd word-splits $COMPOSE_FILES
+              # from an EnvironmentFile, which is what turns this string back into flags.
+              echo "variant: ${!VARIANT}"
+              echo "upstream ref: ${!UPSTREAM_REF}"
+              cat > "${!BASE}/compose.conf" <<CONF
+              COMPOSE_FILES=${!COMPOSE_FILES}
+              CONF
 
-          # Reclaim the build cache; Phase 1 measured ~71 GB of it.
-          docker builder prune -af || true
+              if [ "${!VARIANT}" = "spatialdds" ]; then
+                # A VPC carries no multicast, so RTPS discovery cannot use it. Render the
+                # peer list into the Cyclone config; empty peers is correct for a
+                # single-host deployment, where discovery over loopback needs none.
+                PEER_XML=""
+                for peer in ${!DDS_PEERS}; do
+                  PEER_XML="${!PEER_XML}<Peer address=\"${!peer}\"/>"
+                done
+                sed "s|<!--PEERS-->|${!PEER_XML}|" "${!BASE}/cyclonedds.xml.in" \
+                  > "${!BASE}/cyclonedds.xml" || fail "rendering cyclonedds.xml failed"
+                echo "dds peers: ${!DDS_PEERS:-none (single host)}"
+              fi
 
-          # Start the identity provider first and fail loudly if it does not come up. The
-          # apps only Want (not Require) it, so a broken FusionAuth would otherwise let the
-          # stack reach CREATE_COMPLETE with login silently non-functional — a false green,
-          # which is worse than a failed stack.
-          systemctl start openvps-auth.service || {
-            echo "--- openvps-auth.service failed; diagnostics ---"
-            systemctl status openvps-auth.service --no-pager -l | tail -20 || true
-            docker compose -p openvps-auth -f "${!BASE}/fusionauth/docker-compose.fusionauth.yaml" \
-              --env-file "${!BASE}/fusionauth.env" ps || true
-            docker logs --tail 30 openvps-auth-db-1 2>&1 | tail -30 || true
-            docker logs --tail 30 openvps-auth-fusionauth-1 2>&1 | tail -30 || true
-            fail "openvps-auth.service failed to start"
-          }
-          systemctl start openvps.service || fail "openvps.service failed to start"
-          docker compose -f docker-compose.yaml -f "${!BASE}/docker-compose.aws.yaml" \
-            --env-file "${!BASE}/docker.env" ps
+              # ---- systemd unit: brings the stack up on every boot -------------------------
 
-          systemctl start openvps-idle.timer || true
-          echo "idle shutdown: ${!IDLE_MIN} minutes (0 = disabled)"
-          systemctl list-timers openvps-idle.timer --no-pager || true
+              systemctl daemon-reload
+              systemctl enable openvps-auth.service openvps.service
 
-          echo "=== bootstrap complete $(date -u) ==="
-          signal SUCCESS "bootstrap complete"
+              # ---- idle shutdown (Phase 3) --------------------------------------------------
+              # EXTRA_PORTS and EXTRA_CONTAINERS are how the variant extends the shared idle
+              # detector rather than replacing it: the spatialdds variant adds the web
+              # bridge's port and container so a connected browser client reads as activity.
+              cat > "${!BASE}/idle.conf" <<CONF
+              IDLE_MINUTES=${!IDLE_MIN}
+              MAPS_DIR=${!MAPS_DIR}
+              EXTRA_PORTS=${!IDLE_EXTRA_PORTS}
+              EXTRA_CONTAINERS=${!IDLE_EXTRA_CONTAINERS}
+              HEARTBEAT_FILE=/var/lib/openvps/last-dds-activity
+              CONF
+
+
+
+              systemctl daemon-reload
+              systemctl enable openvps-idle.timer
+
+              # ---- build ------------------------------------------------------------------
+              /usr/local/bin/openvps-render-env || fail "rendering docker.env failed"
+              cd "${!BASE}/openvps" || fail "no source dir"
+              echo "=== build start $(date -u) ==="
+              docker compose ${!COMPOSE_FILES} \
+                --env-file "${!BASE}/docker.env" build || fail "docker compose build failed"
+              echo "=== build done $(date -u) ==="
+
+              # Reclaim the build cache; Phase 1 measured ~71 GB of it.
+              docker builder prune -af || true
+
+              # Start the identity provider first and fail loudly if it does not come up. The
+              # apps only Want (not Require) it, so a broken FusionAuth would otherwise let the
+              # stack reach CREATE_COMPLETE with login silently non-functional — a false green,
+              # which is worse than a failed stack.
+              systemctl start openvps-auth.service || {
+                echo "--- openvps-auth.service failed; diagnostics ---"
+                systemctl status openvps-auth.service --no-pager -l | tail -20 || true
+                docker compose -p openvps-auth -f "${!BASE}/fusionauth/docker-compose.fusionauth.yaml" \
+                  --env-file "${!BASE}/fusionauth.env" ps || true
+                docker logs --tail 30 openvps-auth-db-1 2>&1 | tail -30 || true
+                docker logs --tail 30 openvps-auth-fusionauth-1 2>&1 | tail -30 || true
+                fail "openvps-auth.service failed to start"
+              }
+              systemctl start openvps.service || fail "openvps.service failed to start"
+              docker compose ${!COMPOSE_FILES} \
+                --env-file "${!BASE}/docker.env" ps
+
+              systemctl start openvps-idle.timer || true
+              echo "idle shutdown: ${!IDLE_MIN} minutes (0 = disabled)"
+              systemctl list-timers openvps-idle.timer --no-pager || true
+
+              echo "=== bootstrap complete $(date -u) ==="
+              signal SUCCESS "bootstrap complete"
+
+            - EffectiveUpstreamRef: !If
+                - HasUpstreamRefOverride
+                - !Ref UpstreamRef
+                - !FindInMap [VariantConfig, !Ref Variant, UpstreamRef]
+              ComposeFiles: !FindInMap [VariantConfig, !Ref Variant, ComposeFiles]
+              IdleExtraPorts: !FindInMap [VariantConfig, !Ref Variant, IdleExtraPorts]
+              IdleExtraContainers: !FindInMap [VariantConfig, !Ref Variant, IdleExtraContainers]
 
 Outputs:
   InstanceId:
@@ -602,3 +744,17 @@ Outputs:
     Value: /var/log/openvps-bootstrap.log
   IdleShutdownMinutes:
     Value: !Ref IdleShutdownMinutes
+  Variant:
+    Value: !Ref Variant
+  UpstreamRefDeployed:
+    Description: The commit actually cloned, after variant selection and any override.
+    Value: !If
+      - HasUpstreamRefOverride
+      - !Ref UpstreamRef
+      - !FindInMap [VariantConfig, !Ref Variant, UpstreamRef]
+  WebBridgeEndpoint:
+    Condition: IsSpatialDds
+    Description: >-
+      Reachable from the waker security group only. The waker needs a Caddy route to this
+      before a browser client can use it — see README, "The spatialdds variant".
+    Value: !Sub 'http://${Instance.PrivateIp}:8088'

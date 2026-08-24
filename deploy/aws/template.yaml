@@ -8,6 +8,8 @@ Description: >-
 Metadata:
   AWS::CloudFormation::Interface:
     ParameterGroups:
+      - Label: {default: Variant}
+        Parameters: [Variant, DdsPeers]
       - Label: {default: Placement}
         Parameters: [VpcId, SubnetId]
       - Label: {default: Instance}
@@ -18,8 +20,30 @@ Metadata:
         Parameters: [UpstreamRepo, UpstreamRef, HlocRepo, HlocCommit]
     ParameterLabels:
       SubnetId: {default: 'Public subnet (also fixes the AZ for the maps volume, permanently)'}
+      Variant: {default: 'Which OpenVPS to deploy (geopose is the default and is unchanged)'}
 
 Parameters:
+
+  Variant:
+    Type: String
+    Default: geopose
+    AllowedValues: [geopose, spatialdds]
+    Description: >-
+      Which OpenVPS to deploy. `geopose` is the GeoPose Protocol service on openvps:main and
+      is exactly what this template deployed before the variant existed. `spatialdds` is the
+      SpatialDDS 1.7 VPS binding on the openvps:spatialdds branch, and additionally runs the
+      SpatialDDS web bridge. The variant chooses the upstream ref and the Compose overrides;
+      instance sizing, storage, idle shutdown and the waker are shared. Refs are pinned per
+      variant in the VariantConfig mapping — neither variant tracks a moving branch.
+
+  DdsPeers:
+    Type: String
+    Default: ''
+    Description: >-
+      spatialdds only, and optional. Space-separated unicast DDS peer addresses, e.g.
+      `udp/10.0.1.42`. A VPC does not carry multicast, so RTPS peer discovery across two
+      instances has to be unicast; leave empty for a single-host deployment, where discovery
+      over loopback works without peers. Ignored by the geopose variant.
 
   VpcId:
     Type: AWS::EC2::VPC::Id
@@ -123,8 +147,11 @@ Parameters:
     Default: https://github.com/OpenArCloud/openvps.git
   UpstreamRef:
     Type: String
-    Default: fc2f4706f8cd0340b22685aa67c4a9d63837f3f6
-    Description: Upstream commit verified in Phase 1. Pin it; do not track a branch.
+    Default: ''
+    Description: >-
+      Override the variant's pinned upstream commit. Leave empty — the normal case — and the
+      ref comes from the VariantConfig mapping below, which pins each variant to a verified
+      commit. Set it only to test a specific commit, and pin it; do not name a branch.
   HlocRepo:
     Type: String
     Default: https://github.com/cvg/Hierarchical-Localization.git
@@ -140,9 +167,37 @@ Parameters:
     Default: /aws/service/deeplearning/ami/x86_64/base-oss-nvidia-driver-gpu-ubuntu-22.04/latest/ami-id
     Description: Resolved from the SSM public parameter rather than hardcoded.
 
+Mappings:
+
+  # Everything that differs between the two variants, in one table. Adding a variant means
+  # adding a row here plus a Compose override file; nothing else in the template branches on
+  # the variant name.
+  #
+  # Refs are commit hashes, never branch names. A branch would make two deployments of the
+  # "same" stack produce different software with no record of the difference.
+  VariantConfig:
+    geopose:
+      # openvps:main. Unchanged from before the variant existed, so a stack created with
+      # defaults today is byte-identical to one created before.
+      UpstreamRef: fc2f4706f8cd0340b22685aa67c4a9d63837f3f6
+      ComposeFiles: '-f docker-compose.yaml -f /opt/openvps/docker-compose.aws.yaml'
+      IdleExtraPorts: ''
+      IdleExtraContainers: ''
+    spatialdds:
+      # openvps:spatialdds. The branch currently carries no implementation, so this is the
+      # same commit as geopose and the two variants differ only by the Compose override.
+      # Bump it with each branch checkpoint that changes what runs.
+      UpstreamRef: fc2f4706f8cd0340b22685aa67c4a9d63837f3f6
+      ComposeFiles: '-f docker-compose.yaml -f /opt/openvps/docker-compose.aws.yaml -f /opt/openvps/docker-compose.spatialdds.yaml'
+      # The web bridge's WebSocket port, so a connected browser client counts as activity.
+      IdleExtraPorts: '8088'
+      IdleExtraContainers: 'openvps-webbridge-1'
+
 Conditions:
   WantElasticIp: !Equals [!Ref AttachElasticIp, 'true']
   HasDomain: !Not [!Equals [!Ref DomainName, '']]
+  IsSpatialDds: !Equals [!Ref Variant, 'spatialdds']
+  HasUpstreamRefOverride: !Not [!Equals [!Ref UpstreamRef, '']]
 
 Resources:
 
@@ -214,6 +269,45 @@ Resources:
       ToPort: 8000
       SourceSecurityGroupId: !Ref WakerSecurityGroup
       Description: MapLocalizer, from the waker only
+
+  # --- spatialdds variant only ---------------------------------------------------------
+
+  GpuIngressWebBridge:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: IsSpatialDds
+    Properties:
+      GroupId: !Ref GpuSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8088
+      ToPort: 8088
+      SourceSecurityGroupId: !Ref WakerSecurityGroup
+      Description: SpatialDDS web bridge (HTTP + WebSocket), from the waker only
+
+  # RTPS between GPU hosts, for the two-instance discovery test. Source is this group
+  # itself, so it covers any instance in it and nothing outside the VPC. UDP 7400-7500 is
+  # Cyclone's default port range; TCP is here because a VPC carries no multicast, so a
+  # deployment that cannot use unicast UDP peers falls back to Cyclone's TCP transport.
+  GpuIngressRtpsUdp:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: IsSpatialDds
+    Properties:
+      GroupId: !Ref GpuSecurityGroup
+      IpProtocol: udp
+      FromPort: 7400
+      ToPort: 7500
+      SourceSecurityGroupId: !Ref GpuSecurityGroup
+      Description: RTPS discovery and user traffic, between hosts in this group only
+
+  GpuIngressRtpsTcp:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: IsSpatialDds
+    Properties:
+      GroupId: !Ref GpuSecurityGroup
+      IpProtocol: tcp
+      FromPort: 7400
+      ToPort: 7500
+      SourceSecurityGroupId: !Ref GpuSecurityGroup
+      Description: RTPS over TCP, between hosts in this group only
 
   # ------------------------------------------------------------------ identity
 
@@ -334,15 +428,23 @@ Resources:
           "files": {
             "/opt/openvps/nginx/mapbuilder.conf": {
               "mode": "0644",
-              "gz64": "H4sIAAAAAAACE6VV227bRhB911cM4gAFCotU6rotbPQhMdoUbZqHyH3pi7LiDsWtlrvsztIyUwTIR/QL+yU9u6QkJ3VSGBFM29qdy5kzZ4Yn9Io7qypu2UWqfaBWdeveWM2h/DF4F9np0m2Muy0q7+pTan2PQ03+hsPshEqO1XhfpvtCl5pr1duYzWk9kPbVlsO88m3nhQu1k2JQrS1mJ3C/3nnSbM2ag4pM2tQ1B3YVC9XBt9R3EgOr9iJbE31JlTWAumrV7Wrt9bAS84ZpQf+8+5t6Z01rAK6g3yY/qlQnpCKdLxaLX09p15iqITEWMeyQQxIF/oOrKLSMQQ3LSjnHAYeVD9q4jZBVYYOT2ChH5/T8WUHXDdNaoS6nyURhW5PJ5Qk5P0VF5gtc0ghE4B58v2kIvDikm697WfuBdiY2cKLXGbu8Tve12fQBZUwlv/R0/WJJwgGc09qC0IKulNYDeYe4TDu1TQA5tMaBR0n2pyQ+XyZ4czEbx3oPjUM8UEvSGHBkAJ2BBXEcs0aHHdSwU7nZOOWxYT8AwhAb8EJshTPvKUkX/O1AgKai8U5SctATC+ORaBOUZgJ92ibH5IN0ewBfyCkCb7mLkEvkOVQ4T/+M+GFYo12gUQ1CrGSg6LNQ0Ex2xzJaKFKK2Wyi6a9ZqtQagYJp/Hy3uMyHo8XKqZaJVpezfHhyQr8wd6SsuWGKpmXfo3kcUzpFG+QAv3SjbM95UJbLFyVoLrL3Fq7Zc7X3/PYcP/vY0KP1SkOJganFdJj582fv6+0NmlBAyNqIWluWzGrVcLUlaNUEtsPlFCzeUd9BXYkT2eam53FEGonoIUjt01ARIK8xu3p0x+iMyO+fpzFVbuoq8J89S1yNcVIDfV0fKnt6rKfPRebNAMbE+h34d9usJ6ENo0zfy55bKd7LofSBOnzOvlks5C4IQbEfMZgqyOiPFpPBqIJJllROsshT732yK1XXXR4OjdN8O/0pmtja8ertGIdD8GHVqQ10kzYKnq/wnOH5GpHOF3d9Dkm/P97ck76XUEoDXUxb9D9Jj+API3W3jJGeTongSxNjd1GWkzguzrD07nhd3uN06G6DDnAQbJQPzVLQFXoqCcST4smH95iRyRsyH0f9cfaZBv8T9lfjLkyBH03Wjz5h/pOHpB83+P0RhvDykgeRkx0exMu9OR+a8vMyjnOWt8er/Vvqd9M9AMTn5Vd9bB7Ecnb4/74mzeTmYq1c+YA3cKT0PS/qtHKfIk7x8xKvVmtTApnwvZ39CyDu/AzICAAA"
+              "gz64": "H4sIAAAAAAACE6VUTW/bMAy951cQXc+x2izb0GCHopdhxxa77CIoNh0LtUWVkotkQ//7aFlNgjbtYJSwbEt85OOXPQvIj8jwdwYirQ0RHYzyTa3S4YjQznQIoFezdHiP6E1rH1FH2yH1Eb4u5crasrXoou7MVq+p2ulg/yBkd55pu9OMDz2GqNd9XSNbtwGq62z9jDDV3rnI4otS4dhFQPcWIPMn7gMiA8ZMqTTRkoMipz4IEw24wni/2h9aV+E2P+ZN7NpR9TT6QWZi7c1GagNLpWRdylrI+iyelurYZk/6/aA5Qd8HLkJjGAu3sW5bvCI9BB+ovMc4t3Scxlgeb0KQTROjvyqKtRGgq64WSqkjq9UJo31vGukAcgByL2GDUy1DEYYgLuYXL/UBn63hl9+wvMB5sunH3Tv4G3IOy5TdWUafvQP/QSGKb7m/UaHO+DCpOMlgUl1Ock6l/Bhj71sy1V1ks7vFkriSL+q39ROC+Bi/6WMzqcrJ4P99HWYmNRc+yWQwy2TAsE8/o5oYrsXP/OcdlKZtB4KQ43ua/QMdJ75t2gQAAA=="
             },
             "/opt/openvps/docker-compose.aws.yaml": {
               "mode": "0644",
-              "gz64": "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"
+              "gz64": "H4sIAAAAAAACE7VUTW+cMBC98ytGHHKICoZE20a+ptfeequqlWMGcGM8rm3Itr++A2vaVOqmUpUKyYzffHjeY0zh1IQSyKNbfCyKU6WeoqUhSrjKVgHQBbNgkPAlkqt6Y5Ex8smQi5JNgEmdqmi+c6Xy0EzlT2yNXbGyKCKGxWjcEh6UfkTXnXMXsvOEuRBABaMlfdRKjyhFIEqi3jYiUdDjFsVtDcYNEq73Hov1PM+JynIb4Z8rj6hsGhnTj3tawpgkfCrvP7wv30Cp52DXd1U58oFO39bN9Rnplcm+yMRdOts0Jz9vtuhwEW62W9CYkpdCtDfv6oafVt41TSPKz/lY4xIrpqyEtol7K2ZCribhsCMBUzBMEdqbjMSkQjp6DIY6CW9z7iXFWK7B7Xr9nfzTgJnU19nsZvSmw7DZH9f18Ed2t03Til7xDJCreXllorcvEe0D8SEXB07wLIt8BYTj9JNgaR5mY5lXzf32UmDS2bXu644/Za9mm87uQP9fwLtXH472cFGzZxo9uzRb9G9/jOMvb/EDR33llEwEAAA="
+            },
+            "/opt/openvps/docker-compose.spatialdds.yaml": {
+              "mode": "0644",
+              "gz64": "H4sIAAAAAAACE3WRUWuDMBSF3/0Voe8aH0fAh6wVJlgV6wbbi6Txbg2NicTM1v36xbq1Q7qHQO659zu5h3iKtUCQ7kANXe95PZhBcOiJh9Ce8SOoZroiBGdrWH3Qve1nASEfraY6aLSbM4FQFoxikkyi/8EsnNi4mmE1CKNVC8re4C0t0nxN0+QtLuvnMo0O1nYE47ueD2EYeg5tWSc1Z1J8gZmtFNiTNse61Y0LMsEXedDys4U/u2LdWfyTE/ORS62gafrg3EqCwfKlZvQNHZjBUux/cbIU/g+5fl2neRZvNjsXMYnehQQX8c57V2JX0Cqh6URcTr6lSRaF135exNlLMTefYlpWjzGtouVGWDL3Cc7bZ9yKQdjR+waIQugN6wEAAA=="
+            },
+            "/opt/openvps/cyclonedds.xml.in": {
+              "mode": "0644",
+              "gz64": "H4sIAAAAAAACE2VTy24bORC86ys6c9kEkDRJDouFMVJgWN7AQLIr2HldKbJHQ5hiEyRHtm75iHzhfskWKVuOE0A6sNmsrqqu6d7d7xztOSYrftG8mb9uiL0WY/120Xz+9Pfsr+bdctK9mM0mRBcSDtFuh0xvX7/9k/4N7On8mi6cjAbXH6xmn9jQ6A1HygPTx6tPj+U5Om7Wq2+zh/PsyrDPtrccz0rfpAw4aCeeabW6IS2+t9sxqgxq1MsRMAWclTMm0V5Fq3ye0zWXeZirMm1EMmUBVish489+H1Krj8B4Ni+C72weqIhaX15e38xmS4ocnNLA2ByoMOjWzHFJ7HgHlhQ4AlIZEzklsr5yWZlUuhKlrPQtBRXVjjPHabn1tJPRZyBan6X2Q1FW1uPFvIj9OLpstUqZbCLpe9qwVmNiUnD16w19WV+QEU7kIUmrGA9kofbBoz8SGe4VMMjYpAU7xH0C7u4Rd0pJyLHaY5l4Cl20tXsAKjwNTg5VWh5g253E21QaFDkVsoTpUwnDgGo9VHrN9NKJhA0Ev5qCqaFkHWDc4USjEh7KTKWjwK58J/Tf9x/Vg15ZN0aG1trgi6ubxAVYethcnmPlQ80PjMCPY5RYHfta1naSVzybPhOP4B1v1FYVvvX1fXBW21yxydkECy93Idd+LTGyzoAu+VLQ4reOaZCUz8o+McgGZKyu3Ni+R8xg2dMisXrrHPUWRrDSA0mlXggB1IlWroBNT7tdP4FeIbX3CzUiHSHKBnspBtU3FCRm+OC3+GwQz0n3sPXyYSDAPi2aIeeQztpWl1BbaY/fS7PE3G4lO/AjaxaN8odaQ/U9g7JyxxPOV4hn7JH69FhC8R/OZfOnOyoETYn1DooXTY4jN+0Jo/0dpDt3Tu5O6V72yiXu2l+qR0rtM07d6nGZJ6xf/VoWOl37W/nUXxK0/PnTRnOtPQx8NgLH6hQMbp8cXk7+Bw4CPn0XBQAA"
             },
             "/opt/openvps/fusionauth/docker-compose.fusionauth.yaml": {
               "mode": "0644",
-              "gz64": "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"
+              "gz64": "H4sIAAAAAAACE51VXW/aMBR951dYUbWHacFA1034LYWURk0ISoKmbpoik7jgNcRe7KB1Ff99zgcjKUFDA4lY5557fO17uOmleEsQYJykOy50nMtNrydItqMREagHQLwqfgGgW7xWRM6EXGcqNPzUH+s44TQlZVzl04ylW5LKKgGAhesHM8/0w6VveghcvbaA/VvWwvD9L643bTEP4Al7eovAUy4oS8ua6+hsagQGAnCHM5jQFTyU+zOBMZYY8nXxKNk7luTb6ozFR1e73i19y50by+BeyYdTy9ujc0pl1obgRG6iDYmeDzKSCInAN23iTHX/3rRt7QPQ+DqkIiM4fgH68uQegB43TqJ9r5VoKlUbcILAjTiI0y1huWwgGZEZVYcA14MaERJnMuQkoyxGYDSomKrwAkcgTxMihC4k45zEZSxh6zVN1wi8q1e1UpzRHckQ+CFYqj/RhNQ441LVqvZ83eJfuqC/lS200WCrTloABVMB19q+pxKOB2vZ6AjD41LHnKNh/+O4Pyq5MVGujEXI0sPtHsxYfCKWxrSoBIHar2HVj5dzfiy8cWv4Zrj0bHWseBWhY1cRhEr95uP1CJ7Y6m+i57pB2bS54ZhnHd2mX2TrY2kXi1+k23C0sViEvml4k/vQnM+suRkGjwu1T+HmFRakO8MxHdd7VI4bjpxuhrecB5Zjho47VWo8Y3EeFW3pZpdXv5GSq/tueGM8GA7rhLrGS4p7sCYPfmB4QXhn2YoNc6H+rCzCSUMbPtPouXT/cdUvPF1rlmoNYau80VN0f4bvmxPPDLpyqkhnK6zwwXxE7ZFTo138qWPNQ9MxLPttzjFyNq9plLPBjmzL95fV3D4BD2zHWNwuLXtqelVjr17bSINn2NZs3uI1kAbPdicq8LXFbGH77ukN1ViC9Wuss/voH+5AGbtgqBfjPMqzpHjq+hOm9UqoqZfKaq1GNM/LNYzJDqZ5UpJq1w9Hn/sD9R2WpoeYU6j2l7nomPzDwf+P/nGdy1kmG/ekFbuWW2uXvxneH94MfwAEOdwGLwgAAA=="
             },
             "/opt/openvps/fusionauth/kickstart/kickstart.json": {
               "mode": "0644",
@@ -350,15 +452,15 @@ Resources:
             },
             "/usr/local/bin/openvps-render-env": {
               "mode": "0700",
-              "gz64": "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"
+              "gz64": "H4sIAAAAAAACE72V73OyRhDH3/NXbK0ddeY5wSR9kicJneEJRGmNOIBt0h/DnHBGGuQoHMmTyZP/vXeACiR2nlfVcfR2v7u3t/vh/P47eRnG8hJnaykjDFBOIQkTssJhJH3WHEOVacL4h8SPSSYNofsirK/yklKWsRQnQ5/GK8kxrmzD9X52rJna6fbxUwYZ8VPCsg2O8T1J4Z4wVJrQI45yAgil5D6kMXS6tjE2rVkH/pSg9ULbmDDgumoXzeZahP7JSfoMTuF3WBrG99xIc5bkDBj5wgYd+PoVXnhO4q8pdHyaRwHElEFKcFDVB/WkF0C+hAxGF/Aq8Xr7A3iBhCdmK+j9kPX2FYhz8uyQPLM1jY8B+dAJNwlNGfyd0fhD9pxdFIF9sRxGFAd9bhtmLAjjwVDk7nVHvQ+93mDQEbtJ4Qr+ACSaoVs3msmz/3UBbE1iXr5zNTFuDHXNGB8BwOeFOdUNm/e5dJzL8jIPo2C4DeUabWqOZ00NjsL7uK6ZWldc9ntTxadc15iOszBsTzeutcXUbaTL2XqvJFFGuHxiOa5nzgUCfp5GgLIVoAl0bhEnAhH/CG0IwwFmGDH6QOJzqAtvYb5wt4OfQO9QFGIsElzQOMjO4VhRelWQ6BAvbfTx0/Dox5Nh9S1HmJGMyTgJ5SKeg/EterEpErvKEfVxhMLk8WQgmlINqjosn5TgrHb0Nc1YjDcccZMzgp8eoPdS0ADd0WuvSLGbYVXCLtnFfnQt1zk/6Kg1t7bkTFEUnqI9tbbskzLimVahVApFzRxJ0BbuxLteOPxZLH6WXgFodeLSUB14F9vcrSNJ+QZnD6Ccnko+ZvDT7s4IqP9A0iG/SuDy0pj9aljX0s2dN3HduTe3rds7dbt0auuFw5ObujriZxPrsW0t5jtDtas3tWZj013ohtrlJrHcuzS37tHcnWdimOOJqxZpnYlmG7p3o/HNddNW5TXdEDlf5jHL5YKCDeaP35se6eqB5umDN+Ly9jgQUDrfBlV9rtosHUi0jeb1V2x5c8t21TOlbSobrI6OTocKf4/Oz05OjuuihT1Vu9VC2Csgy3wCwrqxEFcLYd/Bud1eUZrmImC3lCoM/PWGBvBRUd6BRSqv7xo9KYkDkpIA+t3+kw8ogst34gYQhTHJ+PPW4nCVZ/x/p7jAShavNVHDnD8dY9twCuLUvWjvmGuO85tlb0deG5L+eeccSE37+zDt06Ng+T9QVTNpc9P7xbh7e4jK0RTrN+bMM/gtP30nYO98J+hwt5r+RmiL9m/A8jCBLdTKKb8lrYlDRVuLkf8irindU/cv3ALcVFwJAAA="
             },
             "/usr/local/bin/openvps-idle-shutdown": {
               "mode": "0700",
-              "gz64": "H4sIAAAAAAACE51Y63LbuhH+z6fYMk4sJaYu9mmSyuPMeBzlxNPE9sTKnLZJmkORkISIAngIULZie6YP0Sfsk/RbgJRoR6fTVk50wWWxl2/3W/DRH7pjqbrj2MyCR3Si81UhpzNL+73953SeC0XHH+gk02WK6XcyEcqIlEqVioLsTND701E93MGKy4vXf4mq39FpKpSVEymKAa8LHvECq3Pjdv588ZGkMjZWiSDNb0rbmVRTmsWGSj5GWprogk5fvxt+fX969nE0vOw4Kae8L8uwZLxywpyGb3SxiK3UiqxY5FlsBUFStzRFN9NJnDlLNWxa5iaSaSYiMyttqq8UxYrtSwu5hMWQ2VzVsXIhig6NZoUwM52llOiFMDQp9MIdfopFl5Wk91KVFpPQL5lDZB4X8UJYeGspY8Lpttag62QnWk0OqUepNPE44421Suy7QmQrb/EI56y9JQ09NXBkLtKne+w2GFwspILF6cCpVGgMLnVWLgTNhahcPi5lZkku4ikOgsk8CNlv352fUBInM7FXj9Iixp5KAI6LyQg2BS6FE3RZQAs7iy3PKbGEeVLRb6Uw7P4O/RLPEUiIlm4FC7yK56LYNQBAXNjTyhKDY7OsiincQQsRK5yWZQh8WZCe8F6DOBY4ryjFwC0l6nfoTNPJx9fHHIwcLqe80BBo+LyiVArnc8ikqRWISzvThbRAyFKQkVMVZ94GpdlcrHOi8RoLhqH3FjsECxyA5HcPLxaqaJJxpnTcpn2nD8xHEKWZAZijkwuoppRIPCI1fJiX9awRxRJZQrkurAeSnkyisb7eq3WQKsnKlPV4UxpIOIb6SBP6U6/fp3/9458Ql+kp1Fhr4uKE05bSrrxWB04rpVWUaZ2PgUhEz0WJd8VqVeuxyzud9yCTriTnoY+aVACjl/aTk8ZSBHzyTY8B2gLm6WLlUnYskDtX8LDFJyYA4Bq954paB+0BO8TGUgEuMxFndgbIJXNDM8DEx7nSxxBjakX9HkawKfVwzfit0swgrSB5o7bZI8NxqgyFMyaInyjgbV1a5zI2jL+7qNtmRl3pEnntkQwR2A40sngc2Jzj7CROzw4d00IrCetpURrrsjApBGeIQ1sVCM4AgNqUSJtNJnvNgDoLDxjq77/o9PDXp+Ozv/7ydvhhWFuZwVk+w7/xIZXahnNoDw5PYtTJKostylPDgRxIJ4RHUzmZwBPK1VOcauo8UkDQNbWAQIWopW2qXxuVIvx92u93j8tpl1lh0Pvj4ODl4OAFPevh9YXCn4cj6tLb0eii2+/0Q3BHzwkvoYkuEHpkV5U/ouAjTs/enA/uHzM4eN57sY+jtkmj8z87gWfi2na+GScQ0qbKiyNqpRoms5vY7Arjht2FUtJ2th4z4BNUAODh7zj2c6fn/vXrYCRVMLxLxqUPaWWDw1bTDGQMUAC5DSDj4Kk0kGXIMxgosognE5msy+pMM1TWUDIVlkYMyHGJ1MPGDPUJgkvU/4zhw2MItMtwpjbUWNS2IDDCUlRqymUuJrHMguDk/OzN0XaOCT5RVFC4w0tC+kJPnlCn/hk0CfYo3Llp/h5EB727MHh/fHH59fXpB56uvw+i7gxM2C3H0LXsprGNu8wbWH45Oh4N3fruMgb9ynGtkp+CmPWSbhYbG9UJEwaLOeoKRTk11oRBgMi22nTDEZ7CfZG9R9IUATo7T8NDEggyvrZSTsWopGeP34wej/7WJjd7F8C1DbrloDh+R0AFkiSx6yqhhHD113LkzdwtLZHxnUBO6BOOaLoppAhK9OjLIa9TATkkhk61NaVXp6bUuufxe4LaIfaKa8S9F0xkECh9dVQZ8+yxaXMcJ7VnOJC3t7XFWBnSq/VcEKAaGa2OwpBtBmNyx/WALeGB6P9/BdO8/MqSDOLZUkuZyjgyCwmZyMBiFVWnRXGem6NcppjwBegoMcs9pZE83Ejuv+qmYtlVJXj/lqaFyClKgM/ath6cwg5fHwdvTy17m3Fcm4nZwc7Nes0dvzvTQc7DBjNvWNlwbF1BbdAxeERc19y7ppMfTHcYiL5DK39+2Ag9n2AQNRBT9NYqrtdwebM7aFr8OVhXXVgfX81p9yYvJIr1zsEe7fx0t/tgiXfQkHYHrZe924Ner3/7EpX4lluD9mezffkyod1m2dtl73JL1d4ofOM+B1HvDmPscPd7q7P9ymoHEp6h+sg3HI1ug6t4gwpVRY1ryv5vwAexv6YaTUdRbzHojcSvzPDuloCudOZuIzG3HbGLG2q68A2B5RbwShdoM1Ce4wIJicP1BGKvsA1hQePre2LAgDsNaZ1ynf8YYr6XJGxRXYRqCo3666ENS90fXJNIY5i702jiOj33tX8IanBhrGxHq5JzdUJQkOUb9Oy/etLnUHJrhbuHcHvQUDH+triNHpT3u0XoRTo5TeBskPMQOFtXJcBj2AJ5316cX+LtI/4fj07e3r4evhuOhm26B7haxRv+qACHntfXVR5bg857fI27mbU5w+5u4PfeoaaPMTk/RMwD9pYSFRjRr35wXahrSlHpNrdWd7vZdK//Q8XDHbnqE7j/VtOoumvQycXHSKtsxckOKLVOzt+BJ0HqiikgTrl/W0CZPfouc1QYdAauBrVdN8qNBG6W3MPUtxqg6dpfP7g6ufbG5dNWXHJqYizFWM3OTbT6bhyImKCfv7cmWuDeSGH0ABWYsKscjSp42JUiFHRQUqNstV2JiJTTgqWH9wsEuzhyjvfFwSuttibT7xBYxaHj0qyoVW1rH/IFVFjugVyTTgnSaf6ANLmjgLVo6TZUeY9k7pFmO2BBX5HS2NOiFsbQiLKMNjrR5z1qt2vKrxcy3dsfWoBt5L9zU++540se/ZB+DzTfvvHV0Q8bD8k9AmA/MM1qviUzWNBsOOdwxxFWT1x83QUJI0kKAwy6nHI3IPeMBsUZbAn+Rn7wRekCbSrS2jgnuDIKBTcNK3yOe3q2gvRm8fXX5rl0D2Z8ssW+QHIfrIwHPHe7GDErlTjJfA2VKqrusA4xoGV3ofnhMcQkKx19jgXc4i9artKv0HUvaMqXgPgqxqXTjyQ2c06qq2yn5vmqEv3OMleMt6xVSbBu5aIZMUzCasvAY5FZoRE3WvinQWHwb6lFl4dnEwAA"
+              "gz64": "H4sIAAAAAAACE4VV4W7iRhD+76eYbknAvdvYJFV7BRGJuzhNpFwSJT6p6uWEjL2GFfba9a5Jc8C7d3axwRDSQ4DtmW/GM9/Mzvz8kzPmwhkHcmpZkimgZQY5z1kc8MSyPt3dXg6cLFf4Y2KeS4dHCTsJMxFbX4EWQFoaQuAbHB/DSf1oXV/ceKPP17dffO9xQFqL5nOPnrkrYn0e3j+OLq4ftLq+71FnmqXMKcelUKUTBSpw0iCXCPf+8h+Go/u7B984bDz26EaNL/eH17feQwOzlRnglTd88D96Q390eX3jadiuxIAe/aHvmeCceVA4CR/X+a9VaLaBOEkgFQ1CxedcvRArnUW8AJpDA0MsK8kmHRsWgNcJQ72CyiPVjAKliP+F9IGF0wxvO5g7Skt4d3TpH/l/22C0K8viMXxFQJNRAhRduPCtD2rKhAX6LUCMYzktVZQ9C4i4DMYJi6CzU5wdRzZBW/YvV+BaMbcskT0PqlDeHUlblzyu89I1Xy7reBFJ4Hyjs6yCBTITA4K3k7wc5UUWSqStI+Y84gGVKcec/ylZ8ULDLM1LxWiQ53KQ8wgVcVakgRqEcv5eZFMWREjZ6bkTsbkjyiSBJUwKlgMNsefqIFyMXjOzeR3SMlGaFt2bdTyo7bUWG8xK/5OKVfodzddA0iAzzwolB+0P7vLMdbvLD67rLv9wu9026jBQJEwVAXABrUZX9iHKKkvSMtdlywCJ1giGtniKhER+pQR6pQRIpYlmeBknXE6xVM2Un9Ci/iwheJ5Be5EXXChonb2H1q+r9h5kzZAHpNdZB2A/ISWHMPMQ2t3T359OXPPttjWnqiiZvY1yYa496q5Qpmk2zwcpXiMrCzxNupP+j1/NYaj5q09EXGRCMRHR7kaEUyBI+ESwYleYZCHKv++Ig1JNaVxKnglz260Lsx0FugaGiCgLZ9hbXMichUqnhW28Jf30/LirycBUFBclMzZTrnTZKlM8alg/KrkIGeyNulVK1i6Nnyb1W+73qT+ICj1ok86fnr+8v3vEvy/4G/qfrpYX3o3nezbslKwOcaEvVckAqsGhZZuyrWuwqdxUqVwXbtVb266wWceonPUBiwjrxn2jnLoDUBahrB7nzSIXLGRCIW0xF7sYmqZYe0L3qEOFeskZxDhLTZvjtMDB1DgStulEKkwU2jvZ7UO9OehzwRUjPwhau9hdA1tdfEi3SWvMgkZS+7i3U/txStrzXkJRJCkOw0IZXSMncfBcvTGaq+0wLuULdCozu48vwfWPTT4BszdCPFmzvXWgNx0mGwZquwR2pvLOOrAt7WiEpxttOtBBGVDQPmxw4DcXbLteZjVQLzL1arkdWmutRW2zSiGL4dW524v8sOH54JVhH8dwlueaB72XMskgwNrqNWrI0buUWPJFKpaGKjHoevKcSFbMOY6B6iy+ATMD6gBWhNZmW9MpaL5IZdJbF0VPykYCgN2Fi1MS6z9tDW8wxwkAAA=="
             },
             "/usr/local/bin/openvps-fusionauth-configure": {
               "mode": "0700",
-              "gz64": "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"
+              "gz64": "H4sIAAAAAAACE41V7W7iRhT9P09xM6Vru4oxsP1QIeyKZomCdkWjhFStIEKOPYYpZsb1jBNoFqkP0Sfsk/TO2CwgFilECH/MPXPuOXNuvjkLHrkIHkM1J0QxDX4hIeMZS0KeEtIf/ja9GnzqdwOZafwy8ZSpICkUlyIs9LyOD8gY/BxobbuWwgN8/gwvwKK5BCok7F51gK24hmYHNqS+X0NIG29fru7vBr8Oe/ej62nvZjD92P+j/X5Dj94N7u7u+7f21S+9u353rnXWDoJm66d6A/+a7Z8bzSYhqZy5HhLB3xnLwddQdeAnoR9JkfAZ+D5if2eIWbb2ckNIInOYAhdQcxX7C5rwY8PrQCwJQFTkKfgqAV9CELOnQBRpipWGSRBmPFA61IWi8OYNPOYsXGCNShnL4AcSS8HIqwGsikge6JVVvIeKA+oCgj1hP1G4ZFBkB6ISzUQotOrW3N0210BNqcz536FGnDbUjoWm+wxKFOpZCsjfkohkkcYgpIaUKw3VTvDfP/8CV6DnDBY8WiD5XFuWC7aGLGeKCf3+kCSqEptDM+oPe8PRdPABLu9vb/vDEVxcXNCam+Vc6AScb5WDrKqNUA/I1tiGeAt+BA7hy0ziVn8qKc5BrRVBMl17W09lGLv4qK50zIVXnzHt0i3OOYwfPMIT24pWbewPTH3dMHSbHtEII9hKu+4KzEFYmYOA4FiyKqEESo/qdLtAP2BUihS1Oscl4wYiW/auHlMe0wd8WpZwpQqW4+aUeh5xvH17d8pmYa5YJa2V+VA4ZDBGRSq1KPKktaNcYAA7xg6xNa6Cq+3kLslAmBon1vAVDKy1+zZIwm2SgOJ40FzM4BRcG5wtMwf8d3h3BOtQEsmY7U6nzYBeZgEmMgt1NK/LAofQM3r/YlI9Ncs3CPc73PRGl9cwQWKvPdC4zrmUAvlqf7TOWBvCLEt5ZGsCc1CcEi8G+jKpZJrQNl6XHeH15CsCT+hmQ23lUWSCnSrU++KXaYLCGbrVajSO7CkbMwOXxfDMMePXo9EN2CrszJ3btETwttE41sozTuVL8JPjd1sPm8bDU2vITOoupccTr/X9duKZFXvzpGq6/szS1F8I+SzsfwYeVzO1yK3ApULl5zC5+8HF3HWgTMzp5G6zY6LjQOvdl6np4Q5GYGR4OgwnB3Hlji0+e12UquAozXFkhzGOYc0V2hYqPO4I5ECYaFxQehqKGJqthgKZQCbTFNNDD0zZx7Ti5UsEQxNiriKJ6Gt0ICqWeILxJBii5H9JCGV1sgcAAA=="
             },
             "/etc/systemd/system/openvps-auth.service": {
               "mode": "0644",
@@ -366,7 +468,7 @@ Resources:
             },
             "/etc/systemd/system/openvps.service": {
               "mode": "0644",
-              "gz64": "H4sIAAAAAAACE8VSPU8jMRDt/StGovYu1Umc5AIEBRXowh1FlMJ4J4kVr8fY44T99zf7EU6H0lPNh57fvHnj9e/oeaPusbjsE3uK5ilh/PO8Akd9ooJQ2LqD+oXv1WcspiN3wNwUzEfvUF3B7ZYxA+8RfIeRPQ+QMh2lyD+ntk2pQNlTDR1E4pEwM9id9bFIhA5tB76UKrRqYvsyBCLyifJBUww+YiPvd8iwpx51fauRq+4s26YnyYFE/zEVbSvvP2W+2sjFXOa5+ECtV3O2US9DQkMRZQUWH3rRPal8+PBsBizqVTh93N2LP44pD6alxO1Ce47q4QPdalz9OaNpa8ltIGdD++bjGaMzRrFNS/EPPmNH1OzK52H0FuaOXjrNYPswtv+b/wVjT2XBjWP01ge8hG+kgJpAdwI8Wc9L0Ox7pMrw4/p60UjpGyUWGa9eZk2TXSt05ka0qfWjfC8bwmY6PnZ3g+lrYK+r3Hi5vfoLon1mlAADAAA="
+              "gz64": "H4sIAAAAAAACE61SwW7CMAy95yty2DUtp0k79LCNIiFtAq1sHBCaQmogorW7xAH69wu0MG3iuJPt6Pm9ZzuLd7S8FEPwxtmGLWE2aQA/poU0VDfkQXrWZife4CtYBz4ryezAJR7c3hoQj2sG9+dRIvCB3E4RVhYhYe02wHJLNaiwCshBlZp1UlPMJUW9feOVDry90s41ss9u89xsEIuiy5Zi1jaQEYLfEkfftbZ4dpkfLWcteDGPnBY3wziPYXJtllLDaU97iSLHvXWENSCPbAW/Qf1yEkO4FvkRTBHN8dRFWPAurcjoKl1ZvDQoB1iCU7H4gXfYE6rb33Xld8+T1+mkyD9H45e8kOrUptbRhPxlot96LGRopCoj8KAt90GxrYECy/vBoNek5h8lfaQTs07jPE4BJnuIWmIxxvhpqmp5PiOUT21Wh4qtCvFa/RXFN1imVcB6AgAA"
             },
             "/etc/systemd/system/openvps-idle.service": {
               "mode": "0644",
@@ -401,224 +503,272 @@ Resources:
         - {Key: Project, Value: openvps-aws}
         - {Key: Name, Value: !Sub '${AWS::StackName}-gpu'}
       UserData:
-        Fn::Base64: !Sub |
-          #!/bin/bash
-          # First-boot provisioning. Runs once; the systemd unit it installs is what brings
-          # the stack up on every subsequent boot.
-          set -uo pipefail
-          exec > >(tee -a /var/log/openvps-bootstrap.log) 2>&1
-          echo "=== openvps bootstrap $(date -u) ==="
+        Fn::Base64:
+          # Two-argument Fn::Sub: the second argument supplies the variant-derived values,
+          # which Mappings cannot reach through the short form. ${!Var} still escapes a
+          # literal shell variable exactly as before.
+          Fn::Sub:
+            - |
+              #!/bin/bash
+              # First-boot provisioning. Runs once; the systemd unit it installs is what brings
+              # the stack up on every subsequent boot.
+              set -uo pipefail
+              exec > >(tee -a /var/log/openvps-bootstrap.log) 2>&1
+              echo "=== openvps bootstrap $(date -u) ==="
 
-          STACK='${AWS::StackName}'
-          REGION='${AWS::Region}'
-          SECRET_ARN='${SecretsManagerArn}'
-          UPSTREAM_REPO='${UpstreamRepo}'
-          UPSTREAM_REF='${UpstreamRef}'
-          HLOC_REPO='${HlocRepo}'
-          HLOC_COMMIT='${HlocCommit}'
-          DOMAIN='${DomainName}'
-          DEF_LON='${DefaultLongitude}'
-          DEF_LAT='${DefaultLatitude}'
-          LOG_GROUP='${LogGroup}'
-          WAIT_URL='${BootstrapWaitHandle}'
-          IDLE_MIN='${IdleShutdownMinutes}'
+              STACK='${AWS::StackName}'
+              REGION='${AWS::Region}'
+              SECRET_ARN='${SecretsManagerArn}'
+              UPSTREAM_REPO='${UpstreamRepo}'
+              UPSTREAM_REF='${EffectiveUpstreamRef}'
+              HLOC_REPO='${HlocRepo}'
+              HLOC_COMMIT='${HlocCommit}'
+              DOMAIN='${DomainName}'
+              DEF_LON='${DefaultLongitude}'
+              DEF_LAT='${DefaultLatitude}'
+              LOG_GROUP='${LogGroup}'
+              WAIT_URL='${BootstrapWaitHandle}'
+              IDLE_MIN='${IdleShutdownMinutes}'
+              VARIANT='${Variant}'
+              COMPOSE_FILES='${ComposeFiles}'
+              IDLE_EXTRA_PORTS='${IdleExtraPorts}'
+              IDLE_EXTRA_CONTAINERS='${IdleExtraContainers}'
+              DDS_PEERS='${DdsPeers}'
 
-          DATA_DIR=/home/ubuntu/data
-          MAPS_DIR=/home/ubuntu/data/maps
-          FA_DB_DIR=/home/ubuntu/data/fusionauth-db
-          BASE=/opt/openvps
+              DATA_DIR=/home/ubuntu/data
+              MAPS_DIR=/home/ubuntu/data/maps
+              FA_DB_DIR=/home/ubuntu/data/fusionauth-db
+              BASE=/opt/openvps
 
-          TOKEN="$(curl -sf -X PUT http://169.254.169.254/latest/api/token \
-                   -H 'X-aws-ec2-metadata-token-ttl-seconds: 300' || true)"
-          IID="$(curl -sf -H "X-aws-ec2-metadata-token: ${!TOKEN}" \
-                 http://169.254.169.254/latest/meta-data/instance-id || hostname)"
+              TOKEN="$(curl -sf -X PUT http://169.254.169.254/latest/api/token \
+                       -H 'X-aws-ec2-metadata-token-ttl-seconds: 300' || true)"
+              IID="$(curl -sf -H "X-aws-ec2-metadata-token: ${!TOKEN}" \
+                     http://169.254.169.254/latest/meta-data/instance-id || hostname)"
 
-          signal() {
-            curl -sS -X PUT -H 'Content-Type:' --max-time 30 \
-              --data-binary "{\"Status\":\"$1\",\"Reason\":\"$2\",\"UniqueId\":\"${!IID}\",\"Data\":\"$2\"}" \
-              "${!WAIT_URL}" || true
-          }
-          # Signal FAILURE immediately rather than letting CreationPolicy burn its full
-          # 50-minute timeout on a problem we already know about.
-          fail() { echo "BOOTSTRAP FAILED: $*"; signal FAILURE "$*"; exit 1; }
+              signal() {
+                curl -sS -X PUT -H 'Content-Type:' --max-time 30 \
+                  --data-binary "{\"Status\":\"$1\",\"Reason\":\"$2\",\"UniqueId\":\"${!IID}\",\"Data\":\"$2\"}" \
+                  "${!WAIT_URL}" || true
+              }
+              # Signal FAILURE immediately rather than letting CreationPolicy burn its full
+              # 50-minute timeout on a problem we already know about.
+              fail() { echo "BOOTSTRAP FAILED: $*"; signal FAILURE "$*"; exit 1; }
 
-          # ---- fail fast on no egress --------------------------------------------------
-          # Everything below needs the internet: git clones, base images, pip, apt. There
-          # is deliberately no NAT gateway, so this subnet must be public with
-          # auto-assign public IPv4 enabled. Catch it in seconds, not in 50 minutes.
-          NET_OK=""
-          for _ in $(seq 1 18); do
-            if curl -sS --max-time 10 -o /dev/null https://github.com 2>/dev/null; then NET_OK=1; break; fi
-            sleep 5
-          done
-          if [ -z "${!NET_OK}" ]; then
-            echo "--- network diagnostics ---"
-            ip -br addr; ip route; cat /etc/resolv.conf
-            getent hosts github.com || echo "DNS lookup failed"
-            fail "no outbound internet after 90s - is this subnet public with auto-assign public IPv4 on?"
-          fi
-          echo "egress OK"
+              # ---- fail fast on no egress --------------------------------------------------
+              # Everything below needs the internet: git clones, base images, pip, apt. There
+              # is deliberately no NAT gateway, so this subnet must be public with
+              # auto-assign public IPv4 enabled. Catch it in seconds, not in 50 minutes.
+              NET_OK=""
+              for _ in $(seq 1 18); do
+                if curl -sS --max-time 10 -o /dev/null https://github.com 2>/dev/null; then NET_OK=1; break; fi
+                sleep 5
+              done
+              if [ -z "${!NET_OK}" ]; then
+                echo "--- network diagnostics ---"
+                ip -br addr; ip route; cat /etc/resolv.conf
+                getent hosts github.com || echo "DNS lookup failed"
+                fail "no outbound internet after 90s - is this subnet public with auto-assign public IPv4 on?"
+              fi
+              echo "egress OK"
 
-          # ---- data volume ------------------------------------------------------------
-          # Device names are not stable on Nitro: /dev/sdf shows up as /dev/nvmeXn1 with an
-          # unpredictable index. Identify it as "the whole disk that is not the root disk"
-          # — safe because exactly one extra volume is ever attached. Matching on the NVMe
-          # serial (which carries the EBS volume id) would be tighter, but referencing
-          # MapsVolume here would create a cycle: user-data -> volume -> instance AZ.
-          ROOT_PART="$(findmnt -no SOURCE /)"
-          ROOT_NAME="$(lsblk -no PKNAME "${!ROOT_PART}" 2>/dev/null || basename "${!ROOT_PART}")"
-          echo "root disk is /dev/${!ROOT_NAME}"
-          DEV=""
-          for _ in $(seq 1 60); do
-            # EBS volumes report an NVMe serial of the form "vol0123abc..."; instance-store
-            # disks do not. Filtering on that prefix is what keeps us off the ephemeral
-            # disk — every g6 ships one (250 GB on xlarge, 450 GB on 2xlarge), and it is
-            # wiped on every stop/start, so formatting it would silently destroy the maps.
-            while read -r name serial type; do
-              [ "${!type}" = "disk" ] || continue
-              [ "${!name}" = "${!ROOT_NAME}" ] && continue
-              case "${!serial}" in vol*) DEV="/dev/${!name}" ;; esac
-            done < <(lsblk -dn -o NAME,SERIAL,TYPE)
-            [ -n "${!DEV}" ] && break
-            sleep 5
-          done
-          if [ -z "${!DEV}" ]; then
-            echo "--- block devices seen ---"; lsblk -o NAME,SERIAL,TYPE,SIZE,MOUNTPOINT
-            fail "maps EBS volume never appeared as a block device"
-          fi
-          echo "maps volume is ${!DEV}"
+              # ---- data volume ------------------------------------------------------------
+              # Device names are not stable on Nitro: /dev/sdf shows up as /dev/nvmeXn1 with an
+              # unpredictable index. Identify it as "the whole disk that is not the root disk"
+              # — safe because exactly one extra volume is ever attached. Matching on the NVMe
+              # serial (which carries the EBS volume id) would be tighter, but referencing
+              # MapsVolume here would create a cycle: user-data -> volume -> instance AZ.
+              ROOT_PART="$(findmnt -no SOURCE /)"
+              ROOT_NAME="$(lsblk -no PKNAME "${!ROOT_PART}" 2>/dev/null || basename "${!ROOT_PART}")"
+              echo "root disk is /dev/${!ROOT_NAME}"
+              DEV=""
+              for _ in $(seq 1 60); do
+                # EBS volumes report an NVMe serial of the form "vol0123abc..."; instance-store
+                # disks do not. Filtering on that prefix is what keeps us off the ephemeral
+                # disk — every g6 ships one (250 GB on xlarge, 450 GB on 2xlarge), and it is
+                # wiped on every stop/start, so formatting it would silently destroy the maps.
+                while read -r name serial type; do
+                  [ "${!type}" = "disk" ] || continue
+                  [ "${!name}" = "${!ROOT_NAME}" ] && continue
+                  case "${!serial}" in vol*) DEV="/dev/${!name}" ;; esac
+                done < <(lsblk -dn -o NAME,SERIAL,TYPE)
+                [ -n "${!DEV}" ] && break
+                sleep 5
+              done
+              if [ -z "${!DEV}" ]; then
+                echo "--- block devices seen ---"; lsblk -o NAME,SERIAL,TYPE,SIZE,MOUNTPOINT
+                fail "maps EBS volume never appeared as a block device"
+              fi
+              echo "maps volume is ${!DEV}"
 
-          if ! blkid "${!DEV}" >/dev/null 2>&1; then
-            echo "no filesystem on ${!DEV}; creating ext4"
-            mkfs.ext4 -L openvps-maps "${!DEV}" || fail "mkfs failed"
-          else
-            echo "existing filesystem found; leaving it alone"
-          fi
+              if ! blkid "${!DEV}" >/dev/null 2>&1; then
+                echo "no filesystem on ${!DEV}; creating ext4"
+                mkfs.ext4 -L openvps-maps "${!DEV}" || fail "mkfs failed"
+              else
+                echo "existing filesystem found; leaving it alone"
+              fi
 
-          UUID="$(blkid -s UUID -o value "${!DEV}")"
-          [ -n "${!UUID}" ] || fail "could not read UUID"
-          mkdir -p "${!DATA_DIR}"
-          # The volume is mounted at /home/ubuntu/data, not directly at the maps directory,
-          # so FusionAuth's Postgres can live beside the maps on the same RETAINED volume.
-          # That database holds every user account and the OAuth client secret the apps
-          # authenticate with; it has to outlive the instance exactly as the maps do.
-          # Mount by UUID — device names are not stable across reboots, observed changing
-          # from nvme2n1 to nvme1n1 on the first stop/start. nofail so a missing volume
-          # degrades to a failed service rather than an unbootable host.
-          grep -q "${!UUID}" /etc/fstab || \
-            echo "UUID=${!UUID} ${!DATA_DIR} ext4 defaults,nofail,x-systemd.device-timeout=30 0 2" >> /etc/fstab
-          systemctl daemon-reload
-          mount -a || fail "mount failed"
-          mkdir -p "${!MAPS_DIR}" "${!FA_DB_DIR}"
-          # The backend runs as uid 1000 inside its container (MY_USER_ID).
-          chown 1000:1000 "${!MAPS_DIR}"
-          # Postgres runs as uid 70 (alpine). The directory must be owned by that uid BEFORE
-          # the container first starts — left root-owned, the entrypoint cannot create its
-          # PGDATA subdirectory and the container enters a restart loop that survives fixing
-          # the ownership afterwards, because a half-made pgdata is left behind.
-          chown 70:70 "${!FA_DB_DIR}"
-          chmod 700 "${!FA_DB_DIR}"
-          df -h "${!DATA_DIR}"
+              UUID="$(blkid -s UUID -o value "${!DEV}")"
+              [ -n "${!UUID}" ] || fail "could not read UUID"
+              mkdir -p "${!DATA_DIR}"
+              # The volume is mounted at /home/ubuntu/data, not directly at the maps directory,
+              # so FusionAuth's Postgres can live beside the maps on the same RETAINED volume.
+              # That database holds every user account and the OAuth client secret the apps
+              # authenticate with; it has to outlive the instance exactly as the maps do.
+              # Mount by UUID — device names are not stable across reboots, observed changing
+              # from nvme2n1 to nvme1n1 on the first stop/start. nofail so a missing volume
+              # degrades to a failed service rather than an unbootable host.
+              grep -q "${!UUID}" /etc/fstab || \
+                echo "UUID=${!UUID} ${!DATA_DIR} ext4 defaults,nofail,x-systemd.device-timeout=30 0 2" >> /etc/fstab
+              systemctl daemon-reload
+              mount -a || fail "mount failed"
+              mkdir -p "${!MAPS_DIR}" "${!FA_DB_DIR}"
+              # The backend runs as uid 1000 inside its container (MY_USER_ID).
+              chown 1000:1000 "${!MAPS_DIR}"
+              # Postgres runs as uid 70 (alpine). The directory must be owned by that uid BEFORE
+              # the container first starts — left root-owned, the entrypoint cannot create its
+              # PGDATA subdirectory and the container enters a restart loop that survives fixing
+              # the ownership afterwards, because a half-made pgdata is left behind.
+              chown 70:70 "${!FA_DB_DIR}"
+              chmod 700 "${!FA_DB_DIR}"
+              df -h "${!DATA_DIR}"
 
-          # ---- source ------------------------------------------------------------------
-          mkdir -p "${!BASE}/nginx"
-          if [ ! -d "${!BASE}/openvps/.git" ]; then
-            git clone "${!UPSTREAM_REPO}" "${!BASE}/openvps" || fail "clone upstream failed"
-            git -C "${!BASE}/openvps" checkout "${!UPSTREAM_REF}" || fail "checkout upstream failed"
-            git clone "${!HLOC_REPO}" "${!BASE}/openvps/Hierarchical-Localization" || fail "clone hloc failed"
-            git -C "${!BASE}/openvps/Hierarchical-Localization" checkout "${!HLOC_COMMIT}" || fail "checkout hloc failed"
-            git -C "${!BASE}/openvps/Hierarchical-Localization" submodule update --init --recursive || fail "hloc submodules failed"
-          fi
+              # ---- source ------------------------------------------------------------------
+              mkdir -p "${!BASE}/nginx"
+              if [ ! -d "${!BASE}/openvps/.git" ]; then
+                git clone "${!UPSTREAM_REPO}" "${!BASE}/openvps" || fail "clone upstream failed"
+                git -C "${!BASE}/openvps" checkout "${!UPSTREAM_REF}" || fail "checkout upstream failed"
+                git clone "${!HLOC_REPO}" "${!BASE}/openvps/Hierarchical-Localization" || fail "clone hloc failed"
+                git -C "${!BASE}/openvps/Hierarchical-Localization" checkout "${!HLOC_COMMIT}" || fail "checkout hloc failed"
+                git -C "${!BASE}/openvps/Hierarchical-Localization" submodule update --init --recursive || fail "hloc submodules failed"
+              fi
 
-          # ---- AWS-specific config -----------------------------------------------------
-          # Config files, scripts and unit files come from this stack's own Metadata rather
-          # than being inlined here. User-data is capped at 16 KB and embedding them all
-          # blew through it; Metadata rides in the template, which allows 51 KB. It also
-          # means the payloads need no Fn::Sub escaping and stay byte-identical to the
-          # readable copies under deploy/aws/ in this repository.
-          aws cloudformation describe-stack-resource --region "${!REGION}" \
-            --stack-name "${!STACK}" --logical-resource-id Instance \
-            --query 'StackResourceDetail.Metadata' --output text > /tmp/openvps-meta.json \
-            || fail "could not read stack metadata"
+              # ---- AWS-specific config -----------------------------------------------------
+              # Config files, scripts and unit files come from this stack's own Metadata rather
+              # than being inlined here. User-data is capped at 16 KB and embedding them all
+              # blew through it; Metadata rides in the template, which allows 51 KB. It also
+              # means the payloads need no Fn::Sub escaping and stay byte-identical to the
+              # readable copies under deploy/aws/ in this repository.
+              aws cloudformation describe-stack-resource --region "${!REGION}" \
+                --stack-name "${!STACK}" --logical-resource-id Instance \
+                --query 'StackResourceDetail.Metadata' --output text > /tmp/openvps-meta.json \
+                || fail "could not read stack metadata"
 
-          python3 - <<'WRITEFILES' || fail "writing config files failed"
-          import json, os, gzip, base64
-          meta = json.load(open('/tmp/openvps-meta.json'))
-          for path, spec in meta['openvps']['files'].items():
-              os.makedirs(os.path.dirname(path), exist_ok=True)
-              data = gzip.decompress(base64.b64decode(spec['gz64']))
-              with open(path, 'wb') as fh:
-                  fh.write(data)
-              os.chmod(path, int(spec['mode'], 8))
-              print(f"  wrote {path} ({len(data)} bytes, mode {spec['mode']})")
-          WRITEFILES
-          rm -f /tmp/openvps-meta.json
-          # Written here rather than fetched, so a first boot needs nothing but this repo's
-          # pinned upstream. Comments are stripped; the annotated originals live in
-          # deploy/aws/ in the deployment repo.
-
-
-          # ---- env renderer: runs on every boot, so rotated secrets are picked up -------
-
-          cat > "${!BASE}/bootstrap.conf" <<CONF
-          REGION=${!REGION}
-          SECRET_ARN=${!SECRET_ARN}
-          DOMAIN=${!DOMAIN}
-          DEF_LON=${!DEF_LON}
-          DEF_LAT=${!DEF_LAT}
-          CONF
-          chmod 600 "${!BASE}/bootstrap.conf"
-
-          # ---- systemd unit: brings the stack up on every boot -------------------------
-
-          systemctl daemon-reload
-          systemctl enable openvps-auth.service openvps.service
-
-          # ---- idle shutdown (Phase 3) --------------------------------------------------
-          cat > "${!BASE}/idle.conf" <<CONF
-          IDLE_MINUTES=${!IDLE_MIN}
-          MAPS_DIR=${!MAPS_DIR}
-          CONF
+              python3 - <<'WRITEFILES' || fail "writing config files failed"
+              import json, os, gzip, base64
+              meta = json.load(open('/tmp/openvps-meta.json'))
+              for path, spec in meta['openvps']['files'].items():
+                  os.makedirs(os.path.dirname(path), exist_ok=True)
+                  data = gzip.decompress(base64.b64decode(spec['gz64']))
+                  with open(path, 'wb') as fh:
+                      fh.write(data)
+                  os.chmod(path, int(spec['mode'], 8))
+                  print(f"  wrote {path} ({len(data)} bytes, mode {spec['mode']})")
+              WRITEFILES
+              rm -f /tmp/openvps-meta.json
+              # Written here rather than fetched, so a first boot needs nothing but this repo's
+              # pinned upstream. Comments are stripped; the annotated originals live in
+              # deploy/aws/ in the deployment repo.
 
 
+              # ---- env renderer: runs on every boot, so rotated secrets are picked up -------
 
-          systemctl daemon-reload
-          systemctl enable openvps-idle.timer
+              cat > "${!BASE}/bootstrap.conf" <<CONF
+              REGION=${!REGION}
+              SECRET_ARN=${!SECRET_ARN}
+              DOMAIN=${!DOMAIN}
+              DEF_LON=${!DEF_LON}
+              DEF_LAT=${!DEF_LAT}
+              CONF
+              chmod 600 "${!BASE}/bootstrap.conf"
 
-          # ---- build ------------------------------------------------------------------
-          /usr/local/bin/openvps-render-env || fail "rendering docker.env failed"
-          cd "${!BASE}/openvps" || fail "no source dir"
-          echo "=== build start $(date -u) ==="
-          docker compose -f docker-compose.yaml -f "${!BASE}/docker-compose.aws.yaml" \
-            --env-file "${!BASE}/docker.env" build || fail "docker compose build failed"
-          echo "=== build done $(date -u) ==="
+              # ---- variant ------------------------------------------------------------------
+              # The Compose file list lives in a conf file rather than being baked into the
+              # systemd unit, so the unit is one shared file across both variants and the
+              # variant is a single value in one place. systemd word-splits $COMPOSE_FILES
+              # from an EnvironmentFile, which is what turns this string back into flags.
+              echo "variant: ${!VARIANT}"
+              echo "upstream ref: ${!UPSTREAM_REF}"
+              cat > "${!BASE}/compose.conf" <<CONF
+              COMPOSE_FILES=${!COMPOSE_FILES}
+              CONF
 
-          # Reclaim the build cache; Phase 1 measured ~71 GB of it.
-          docker builder prune -af || true
+              if [ "${!VARIANT}" = "spatialdds" ]; then
+                # A VPC carries no multicast, so RTPS discovery cannot use it. Render the
+                # peer list into the Cyclone config; empty peers is correct for a
+                # single-host deployment, where discovery over loopback needs none.
+                PEER_XML=""
+                for peer in ${!DDS_PEERS}; do
+                  PEER_XML="${!PEER_XML}<Peer address=\"${!peer}\"/>"
+                done
+                sed "s|<!--PEERS-->|${!PEER_XML}|" "${!BASE}/cyclonedds.xml.in" \
+                  > "${!BASE}/cyclonedds.xml" || fail "rendering cyclonedds.xml failed"
+                echo "dds peers: ${!DDS_PEERS:-none (single host)}"
+              fi
 
-          # Start the identity provider first and fail loudly if it does not come up. The
-          # apps only Want (not Require) it, so a broken FusionAuth would otherwise let the
-          # stack reach CREATE_COMPLETE with login silently non-functional — a false green,
-          # which is worse than a failed stack.
-          systemctl start openvps-auth.service || {
-            echo "--- openvps-auth.service failed; diagnostics ---"
-            systemctl status openvps-auth.service --no-pager -l | tail -20 || true
-            docker compose -p openvps-auth -f "${!BASE}/fusionauth/docker-compose.fusionauth.yaml" \
-              --env-file "${!BASE}/fusionauth.env" ps || true
-            docker logs --tail 30 openvps-auth-db-1 2>&1 | tail -30 || true
-            docker logs --tail 30 openvps-auth-fusionauth-1 2>&1 | tail -30 || true
-            fail "openvps-auth.service failed to start"
-          }
-          systemctl start openvps.service || fail "openvps.service failed to start"
-          docker compose -f docker-compose.yaml -f "${!BASE}/docker-compose.aws.yaml" \
-            --env-file "${!BASE}/docker.env" ps
+              # ---- systemd unit: brings the stack up on every boot -------------------------
 
-          systemctl start openvps-idle.timer || true
-          echo "idle shutdown: ${!IDLE_MIN} minutes (0 = disabled)"
-          systemctl list-timers openvps-idle.timer --no-pager || true
+              systemctl daemon-reload
+              systemctl enable openvps-auth.service openvps.service
 
-          echo "=== bootstrap complete $(date -u) ==="
-          signal SUCCESS "bootstrap complete"
+              # ---- idle shutdown (Phase 3) --------------------------------------------------
+              # EXTRA_PORTS and EXTRA_CONTAINERS are how the variant extends the shared idle
+              # detector rather than replacing it: the spatialdds variant adds the web
+              # bridge's port and container so a connected browser client reads as activity.
+              cat > "${!BASE}/idle.conf" <<CONF
+              IDLE_MINUTES=${!IDLE_MIN}
+              MAPS_DIR=${!MAPS_DIR}
+              EXTRA_PORTS=${!IDLE_EXTRA_PORTS}
+              EXTRA_CONTAINERS=${!IDLE_EXTRA_CONTAINERS}
+              HEARTBEAT_FILE=/var/lib/openvps/last-dds-activity
+              CONF
+
+
+
+              systemctl daemon-reload
+              systemctl enable openvps-idle.timer
+
+              # ---- build ------------------------------------------------------------------
+              /usr/local/bin/openvps-render-env || fail "rendering docker.env failed"
+              cd "${!BASE}/openvps" || fail "no source dir"
+              echo "=== build start $(date -u) ==="
+              docker compose ${!COMPOSE_FILES} \
+                --env-file "${!BASE}/docker.env" build || fail "docker compose build failed"
+              echo "=== build done $(date -u) ==="
+
+              # Reclaim the build cache; Phase 1 measured ~71 GB of it.
+              docker builder prune -af || true
+
+              # Start the identity provider first and fail loudly if it does not come up. The
+              # apps only Want (not Require) it, so a broken FusionAuth would otherwise let the
+              # stack reach CREATE_COMPLETE with login silently non-functional — a false green,
+              # which is worse than a failed stack.
+              systemctl start openvps-auth.service || {
+                echo "--- openvps-auth.service failed; diagnostics ---"
+                systemctl status openvps-auth.service --no-pager -l | tail -20 || true
+                docker compose -p openvps-auth -f "${!BASE}/fusionauth/docker-compose.fusionauth.yaml" \
+                  --env-file "${!BASE}/fusionauth.env" ps || true
+                docker logs --tail 30 openvps-auth-db-1 2>&1 | tail -30 || true
+                docker logs --tail 30 openvps-auth-fusionauth-1 2>&1 | tail -30 || true
+                fail "openvps-auth.service failed to start"
+              }
+              systemctl start openvps.service || fail "openvps.service failed to start"
+              docker compose ${!COMPOSE_FILES} \
+                --env-file "${!BASE}/docker.env" ps
+
+              systemctl start openvps-idle.timer || true
+              echo "idle shutdown: ${!IDLE_MIN} minutes (0 = disabled)"
+              systemctl list-timers openvps-idle.timer --no-pager || true
+
+              echo "=== bootstrap complete $(date -u) ==="
+              signal SUCCESS "bootstrap complete"
+
+            - EffectiveUpstreamRef: !If
+                - HasUpstreamRefOverride
+                - !Ref UpstreamRef
+                - !FindInMap [VariantConfig, !Ref Variant, UpstreamRef]
+              ComposeFiles: !FindInMap [VariantConfig, !Ref Variant, ComposeFiles]
+              IdleExtraPorts: !FindInMap [VariantConfig, !Ref Variant, IdleExtraPorts]
+              IdleExtraContainers: !FindInMap [VariantConfig, !Ref Variant, IdleExtraContainers]
 
 Outputs:
   InstanceId:
@@ -650,3 +800,17 @@ Outputs:
     Value: /var/log/openvps-bootstrap.log
   IdleShutdownMinutes:
     Value: !Ref IdleShutdownMinutes
+  Variant:
+    Value: !Ref Variant
+  UpstreamRefDeployed:
+    Description: The commit actually cloned, after variant selection and any override.
+    Value: !If
+      - HasUpstreamRefOverride
+      - !Ref UpstreamRef
+      - !FindInMap [VariantConfig, !Ref Variant, UpstreamRef]
+  WebBridgeEndpoint:
+    Condition: IsSpatialDds
+    Description: >-
+      Reachable from the waker security group only. The waker needs a Caddy route to this
+      before a browser client can use it — see README, "The spatialdds variant".
+    Value: !Sub 'http://${Instance.PrivateIp}:8088'
