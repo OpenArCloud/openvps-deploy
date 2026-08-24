@@ -29,21 +29,19 @@ Parameters:
     Default: geopose
     AllowedValues: [geopose, spatialdds]
     Description: >-
-      Which OpenVPS to deploy. `geopose` is the GeoPose Protocol service on openvps:main and
-      is exactly what this template deployed before the variant existed. `spatialdds` is the
-      SpatialDDS 1.7 VPS binding on the openvps:spatialdds branch, and additionally runs the
-      SpatialDDS web bridge. The variant chooses the upstream ref and the Compose overrides;
-      instance sizing, storage, idle shutdown and the waker are shared. Refs are pinned per
-      variant in the VariantConfig mapping — neither variant tracks a moving branch.
+      `geopose` is the GeoPose Protocol service on openvps:main, and is what this template
+      deployed before the variant existed. `spatialdds` is the SpatialDDS 1.7 VPS binding
+      on the openvps:spatialdds branch. The variant selects the upstream ref and the
+      Compose overrides; sizing, storage, idle shutdown and the waker are shared. See the
+      VariantConfig mapping — neither variant tracks a moving branch.
 
   DdsPeers:
     Type: String
     Default: ''
     Description: >-
-      spatialdds only, and optional. Space-separated unicast DDS peer addresses, e.g.
-      `udp/10.0.1.42`. A VPC does not carry multicast, so RTPS peer discovery across two
-      instances has to be unicast; leave empty for a single-host deployment, where discovery
-      over loopback works without peers. Ignored by the geopose variant.
+      spatialdds only, optional. Space-separated unicast DDS peers, e.g. `udp/10.0.1.42`.
+      A VPC carries no multicast, so cross-instance RTPS discovery must be unicast. Leave
+      empty for a single host, where loopback discovery needs no peers.
 
   VpcId:
     Type: AWS::EC2::VPC::Id
@@ -149,9 +147,9 @@ Parameters:
     Type: String
     Default: ''
     Description: >-
-      Override the variant's pinned upstream commit. Leave empty — the normal case — and the
-      ref comes from the VariantConfig mapping below, which pins each variant to a verified
-      commit. Set it only to test a specific commit, and pin it; do not name a branch.
+      Override the variant's pinned upstream commit. Leave empty (the normal case) to take
+      the ref from the VariantConfig mapping. Set only to test a specific commit, and give
+      a commit hash, not a branch.
   HlocRepo:
     Type: String
     Default: https://github.com/cvg/Hierarchical-Localization.git
@@ -169,24 +167,19 @@ Parameters:
 
 Mappings:
 
-  # Everything that differs between the two variants, in one table. Adding a variant means
-  # adding a row here plus a Compose override file; nothing else in the template branches on
-  # the variant name.
-  #
-  # Refs are commit hashes, never branch names. A branch would make two deployments of the
-  # "same" stack produce different software with no record of the difference.
+  # Everything that differs between the variants, in one table: adding a variant is a row
+  # here plus a Compose override. Refs are commit hashes, never branch names — a branch
+  # would let two deployments of the "same" stack run different software unrecorded.
   VariantConfig:
     geopose:
-      # openvps:main. Unchanged from before the variant existed, so a stack created with
-      # defaults today is byte-identical to one created before.
+      # openvps:main. Unchanged, so a defaults stack matches one created before variants.
       UpstreamRef: fc2f4706f8cd0340b22685aa67c4a9d63837f3f6
       ComposeFiles: '-f docker-compose.yaml -f /opt/openvps/docker-compose.aws.yaml'
       IdleExtraPorts: ''
       IdleExtraContainers: ''
     spatialdds:
-      # openvps:spatialdds. The branch currently carries no implementation, so this is the
-      # same commit as geopose and the two variants differ only by the Compose override.
-      # Bump it with each branch checkpoint that changes what runs.
+      # openvps:spatialdds. No implementation on the branch yet, so this is the same commit
+      # as geopose and the variants differ only by the Compose override. Bump per checkpoint.
       UpstreamRef: fc2f4706f8cd0340b22685aa67c4a9d63837f3f6
       ComposeFiles: '-f docker-compose.yaml -f /opt/openvps/docker-compose.aws.yaml -f /opt/openvps/docker-compose.spatialdds.yaml'
       # The web bridge's WebSocket port, so a connected browser client counts as activity.
@@ -281,12 +274,11 @@ Resources:
       FromPort: 8088
       ToPort: 8088
       SourceSecurityGroupId: !Ref WakerSecurityGroup
-      Description: SpatialDDS web bridge (HTTP + WebSocket), from the waker only
+      Description: SpatialDDS web bridge (HTTP + WS), from the waker only
 
   # RTPS between GPU hosts, for the two-instance discovery test. Source is this group
-  # itself, so it covers any instance in it and nothing outside the VPC. UDP 7400-7500 is
-  # Cyclone's default port range; TCP is here because a VPC carries no multicast, so a
-  # deployment that cannot use unicast UDP peers falls back to Cyclone's TCP transport.
+  # itself, so it covers members and nothing outside. 7400-7500 is Cyclone's default range;
+  # TCP is here for deployments that fall back to Cyclone's TCP transport.
   GpuIngressRtpsUdp:
     Type: AWS::EC2::SecurityGroupIngress
     Condition: IsSpatialDds
@@ -296,7 +288,7 @@ Resources:
       FromPort: 7400
       ToPort: 7500
       SourceSecurityGroupId: !Ref GpuSecurityGroup
-      Description: RTPS discovery and user traffic, between hosts in this group only
+      Description: RTPS discovery and user traffic, within this group only
 
   GpuIngressRtpsTcp:
     Type: AWS::EC2::SecurityGroupIngress
@@ -440,7 +432,7 @@ Resources:
             },
             "/opt/openvps/cyclonedds.xml.in": {
               "mode": "0644",
-              "gz64": "H4sIAAAAAAACE2VTy24bORC86ys6c9kEkDRJDouFMVJgWN7AQLIr2HldKbJHQ5hiEyRHtm75iHzhfskWKVuOE0A6sNmsrqqu6d7d7xztOSYrftG8mb9uiL0WY/120Xz+9Pfsr+bdctK9mM0mRBcSDtFuh0xvX7/9k/4N7On8mi6cjAbXH6xmn9jQ6A1HygPTx6tPj+U5Om7Wq2+zh/PsyrDPtrccz0rfpAw4aCeeabW6IS2+t9sxqgxq1MsRMAWclTMm0V5Fq3ye0zWXeZirMm1EMmUBVish489+H1Krj8B4Ni+C72weqIhaX15e38xmS4ocnNLA2ByoMOjWzHFJ7HgHlhQ4AlIZEzklsr5yWZlUuhKlrPQtBRXVjjPHabn1tJPRZyBan6X2Q1FW1uPFvIj9OLpstUqZbCLpe9qwVmNiUnD16w19WV+QEU7kIUmrGA9kofbBoz8SGe4VMMjYpAU7xH0C7u4Rd0pJyLHaY5l4Cl20tXsAKjwNTg5VWh5g253E21QaFDkVsoTpUwnDgGo9VHrN9NKJhA0Ev5qCqaFkHWDc4USjEh7KTKWjwK58J/Tf9x/Vg15ZN0aG1trgi6ubxAVYethcnmPlQ80PjMCPY5RYHfta1naSVzybPhOP4B1v1FYVvvX1fXBW21yxydkECy93Idd+LTGyzoAu+VLQ4reOaZCUz8o+McgGZKyu3Ni+R8xg2dMisXrrHPUWRrDSA0mlXggB1IlWroBNT7tdP4FeIbX3CzUiHSHKBnspBtU3FCRm+OC3+GwQz0n3sPXyYSDAPi2aIeeQztpWl1BbaY/fS7PE3G4lO/AjaxaN8odaQ/U9g7JyxxPOV4hn7JH69FhC8R/OZfOnOyoETYn1DooXTY4jN+0Jo/0dpDt3Tu5O6V72yiXu2l+qR0rtM07d6nGZJ6xf/VoWOl37W/nUXxK0/PnTRnOtPQx8NgLH6hQMbp8cXk7+Bw4CPn0XBQAA"
+              "gz64": "H4sIAAAAAAACE2WTQW/bMAyF7/kVnM+x3fUwDF2Somi6IcC6BU277cpItC1UFgVJSep/P8ppU7S92RT9+PjpeXb51FvYU4iG3bz4XJ0VQE6xNq6dFw/338uvxeViMvtUlhOAa/ZDMG2X4Pzs/Av89uTg6g6uLe90Bber+wo26+W/8qdR5CKVK00umcZQuMinkywxKMuOYLncgGLXmBYaDpA6gugxGbRaR9hjMOhSBXfkNAXSgAm2zAkSgzpKSF8l5qdwMKkT5Syxvrm520CP4ZECbMnyAQJ5i0oUtgPkwWuSI7LUizXw8oxaB4oRjBslljrmlggxoXoUXY8Be0oUquz/dmeTURgTmAjcNDJF4S4SoKD4u4E/62vQTBGcmFUYwgBG9nhZW5uoOOPOdvqT1nYQaU0NSmUKkcES7uUK5FsxDa3ZiyJKh7c8jM5TJ0QOHB5jbkCw6BP76WtJpommcbKGUwR5KFhmv5WtpuJWQzRWlOwAjXF6NNzlkagCC450YCjzVriNNCo0gkuci2pAIZUvLR87oBA4VLB83m3IaHbuuBm2mD2MaPPnYE1mJyVC/Q2o92nsH2Ml0jkMKNZcawk6joLjILPk3jAILOMlFivJxNMcd5IFH3graLK6ZYUWPIck/lxL1aQsJbnP5HPeJC0uzosuJR8v6lrlBBmujzEsFjJ9tuRe/ILR8wLdMNak+oMcBbTHN3lfOYlDI6mKLyUp/qKU4Z/OIBvUOTi9cTQvUthRUZ806o8isysriT0lbNGgjTSr31WPluo3nmYn9iet97wW2c6s/lA+9ee7XeQfffyJhJ00j7XngW9GyOtISgDXr4QXk/8vztFXUAQAAA=="
             },
             "/opt/openvps/fusionauth/docker-compose.fusionauth.yaml": {
               "mode": "0644",
@@ -460,7 +452,7 @@ Resources:
             },
             "/usr/local/bin/openvps-fusionauth-configure": {
               "mode": "0700",
-              "gz64": "H4sIAAAAAAACE41V7W7iRhT9P09xM6Vru4oxsP1QIeyKZomCdkWjhFStIEKOPYYpZsb1jBNoFqkP0Sfsk/TO2CwgFilECH/MPXPuOXNuvjkLHrkIHkM1J0QxDX4hIeMZS0KeEtIf/ja9GnzqdwOZafwy8ZSpICkUlyIs9LyOD8gY/BxobbuWwgN8/gwvwKK5BCok7F51gK24hmYHNqS+X0NIG29fru7vBr8Oe/ej62nvZjD92P+j/X5Dj94N7u7u+7f21S+9u353rnXWDoJm66d6A/+a7Z8bzSYhqZy5HhLB3xnLwddQdeAnoR9JkfAZ+D5if2eIWbb2ckNIInOYAhdQcxX7C5rwY8PrQCwJQFTkKfgqAV9CELOnQBRpipWGSRBmPFA61IWi8OYNPOYsXGCNShnL4AcSS8HIqwGsikge6JVVvIeKA+oCgj1hP1G4ZFBkB6ISzUQotOrW3N0210BNqcz536FGnDbUjoWm+wxKFOpZCsjfkohkkcYgpIaUKw3VTvDfP/8CV6DnDBY8WiD5XFuWC7aGLGeKCf3+kCSqEptDM+oPe8PRdPABLu9vb/vDEVxcXNCam+Vc6AScb5WDrKqNUA/I1tiGeAt+BA7hy0ziVn8qKc5BrRVBMl17W09lGLv4qK50zIVXnzHt0i3OOYwfPMIT24pWbewPTH3dMHSbHtEII9hKu+4KzEFYmYOA4FiyKqEESo/qdLtAP2BUihS1Oscl4wYiW/auHlMe0wd8WpZwpQqW4+aUeh5xvH17d8pmYa5YJa2V+VA4ZDBGRSq1KPKktaNcYAA7xg6xNa6Cq+3kLslAmBon1vAVDKy1+zZIwm2SgOJ40FzM4BRcG5wtMwf8d3h3BOtQEsmY7U6nzYBeZgEmMgt1NK/LAofQM3r/YlI9Ncs3CPc73PRGl9cwQWKvPdC4zrmUAvlqf7TOWBvCLEt5ZGsCc1CcEi8G+jKpZJrQNl6XHeH15CsCT+hmQ23lUWSCnSrU++KXaYLCGbrVajSO7CkbMwOXxfDMMePXo9EN2CrszJ3btETwttE41sozTuVL8JPjd1sPm8bDU2vITOoupccTr/X9duKZFXvzpGq6/szS1F8I+SzsfwYeVzO1yK3ApULl5zC5+8HF3HWgTMzp5G6zY6LjQOvdl6np4Q5GYGR4OgwnB3Hlji0+e12UquAozXFkhzGOYc0V2hYqPO4I5ECYaFxQehqKGJqthgKZQCbTFNNDD0zZx7Ti5UsEQxNiriKJ6Gt0ICqWeILxJBii5H9JCGV1sgcAAA=="
+              "gz64": "H4sIAAAAAAACE41Vf2/iRhD9fz/FZI+e7SrGwPValYQ70RynoFY0SkjVikRoY6/xFrPretcJNEHqh+gn7CfprH80pATpiBD27szsm/f2Td4cBXdCBndMJ4RobsAvFGQi4zETKSGjyS/zz+OfRoNAZQa/XN5nOogLLZRkhUnauEBm4OdAW00shVt4eoJH4GGigEoFz1snwNfCQPcEtqS9m0NIH18fP19fjX+eDK+n5/PhxXj+4+i3/sct3dsbX11djy7LrR+GV6NBYkzWD4Ju77t2B/+6/e873S4hqVq4HgLB3wXPwTdQd+DHzA+VjMUCfB9rf22BlWjLxy0hhksmjR5QSmKVwxyEhJar+R/QhW873glEigA0US03LPIUfB2Dfw50iMyoXPzJDNLUh9Z+VxRPssgDlomgqkI9ePsW7nLOllhZp5xn8J5ESnJLsMSE+rSGX4zCxoCGqkgjkMpAKrRpMAGLDfb8HlaI/J+//oZIRLAU4VIblhsI8RzDwSQcEBIs+ebjC3EI7kdW1+loMpxM5+NPcHZ9eTmaTOH09JS23CwX0sTgfKWdXWhPkG2wefkO/BAcIlaZwtN+10oeg95ogsAG5Ws7VSxycamtTSSk115w49KmzjHMbj0i4rIto/vYK9j8tkXodj3yBoagjQqXKAx2lKaQMI34WWjSDSBpNQ8nkOU8RiJsp3ZZshWP4BPe7yI1gCeYhCEdCZMLrtvEIDzJ18Z112CFX1vhETQGriuItgBqNRgAratQ7xhDZh1EXLLimhkVEb3F1SpFaF3wHJui1POI49HKH/9TL2O5bmCXUr4UBBHMkOlaBYo4aWvPEng3TmyrsrkcdbnWs4wVGGCpVXgDr9TA3PLcDolFaSKgOBmMkAs4VK4PToPMAf8Dvu2VdSgJVcSfvQK+gsCssgDNmDETJm1V4Px5wDv1aA09t+FbLPcrXAynZ+dwg8C+1F4Y55wpiXiNP91kvA8sy1IRljmBvYBOVS8C+nhT03RD+/hcdYTPN68QfEO3W1pm7hk4eGaFev/pZZugcIRq9TqdPXmqxuysxUv5IEwC59PpBZRZ2JmblC4M4V2ns8+VZ5XKV+DH+3uNhl2r4aEYslDm1QnX+6aZcDZiZ7rVTbcfeJr6S6keZPlPQUT1OC3ykuCKoerzciLsDgT0s7WndczhidB4x1rHgd6HIOL3gSzS1MMTLMGI8LAZDo7UWp0y+ejLrFQbRxuB04ZF9zw3QqNsOHccW8ipR26lKZMRdHsdDSqGTKUpuoe+EGW3ZklebgcTihAJHSqsvkEFwmKFNxhvggVK/gWflXjTrQcAAA=="
             },
             "/etc/systemd/system/openvps-auth.service": {
               "mode": "0644",
@@ -504,9 +496,8 @@ Resources:
         - {Key: Name, Value: !Sub '${AWS::StackName}-gpu'}
       UserData:
         Fn::Base64:
-          # Two-argument Fn::Sub: the second argument supplies the variant-derived values,
-          # which Mappings cannot reach through the short form. ${!Var} still escapes a
-          # literal shell variable exactly as before.
+          # Two-argument Fn::Sub: the second argument carries the variant-derived values,
+          # which Mappings cannot reach through the short form. ${!Var} escapes as before.
           Fn::Sub:
             - |
               #!/bin/bash
@@ -682,10 +673,9 @@ Resources:
               chmod 600 "${!BASE}/bootstrap.conf"
 
               # ---- variant ------------------------------------------------------------------
-              # The Compose file list lives in a conf file rather than being baked into the
-              # systemd unit, so the unit is one shared file across both variants and the
-              # variant is a single value in one place. systemd word-splits $COMPOSE_FILES
-              # from an EnvironmentFile, which is what turns this string back into flags.
+              # The Compose file list goes in a conf file rather than the systemd unit, so
+              # the unit is shared and the variant lives in one place. systemd word-splits
+              # $COMPOSE_FILES from an EnvironmentFile, turning this back into flags.
               echo "variant: ${!VARIANT}"
               echo "upstream ref: ${!UPSTREAM_REF}"
               cat > "${!BASE}/compose.conf" <<CONF
@@ -711,9 +701,8 @@ Resources:
               systemctl enable openvps-auth.service openvps.service
 
               # ---- idle shutdown (Phase 3) --------------------------------------------------
-              # EXTRA_PORTS and EXTRA_CONTAINERS are how the variant extends the shared idle
-              # detector rather than replacing it: the spatialdds variant adds the web
-              # bridge's port and container so a connected browser client reads as activity.
+              # EXTRA_PORTS/EXTRA_CONTAINERS extend the shared idle detector rather than
+              # replacing it; spatialdds adds the web bridge so a browser reads as activity.
               cat > "${!BASE}/idle.conf" <<CONF
               IDLE_MINUTES=${!IDLE_MIN}
               MAPS_DIR=${!MAPS_DIR}
@@ -811,6 +800,6 @@ Outputs:
   WebBridgeEndpoint:
     Condition: IsSpatialDds
     Description: >-
-      Reachable from the waker security group only. The waker needs a Caddy route to this
-      before a browser client can use it — see README, "The spatialdds variant".
+      Reachable from the waker security group only. Needs a Caddy route on the waker before
+      a browser can use it — see README, "The spatialdds variant".
     Value: !Sub 'http://${Instance.PrivateIp}:8088'

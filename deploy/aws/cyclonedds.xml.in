@@ -1,21 +1,16 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  Copyright 2026 Open AR Cloud
-  Licensed under the MIT License.
-  SPDX-License-Identifier: MIT
+  Copyright 2026 Open AR Cloud. MIT. SPDX-License-Identifier: MIT
 
-  Cyclone DDS configuration for the spatialdds variant. Rendered at boot to
-  /opt/openvps/cyclonedds.xml with <!--PEERS--> replaced by one <Peer> element per
-  address in the DdsPeers stack parameter, then mounted into the containers.
+  Cyclone DDS config for the spatialdds variant. Rendered at boot to cyclonedds.xml, with
+  the PEERS marker below replaced by one Peer element per address in the DdsPeers stack
+  parameter.
 
-  Multicast is off because an AWS VPC does not carry it. Cyclone's default discovery is
-  multicast, so leaving it on gives a deployment that works on a laptop, works on one
-  instance (loopback), and silently discovers nothing across two — the failure being an
-  absence of peers rather than an error.
-
-  With multicast off, discovery is unicast against an explicit peer list. Empty is correct
-  for a single host: participants in different containers still find each other over
-  localhost, because ParticipantIndex=auto probes the local port range.
+  Multicast is off because an AWS VPC does not carry it. Cyclone discovers by multicast by
+  default, so leaving it on gives a deployment that works on a laptop, works on one
+  instance over loopback, and silently finds nothing across two - an absence of peers
+  rather than an error. Discovery is unicast against the peer list instead; empty is right
+  for a single host, where ParticipantIndex=auto probes the local port range.
 -->
 <CycloneDDS xmlns="https://cdds.io/config">
   <Domain id="any">

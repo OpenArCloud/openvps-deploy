@@ -35,15 +35,31 @@ BASE=http://127.0.0.1:9011
 
 log() { logger -t openvps-fa-config -- "$*"; echo "$*"; }
 
-# FusionAuth reports healthy before its API is reliably serving; poll.
+# Poll the authenticated call, not /api/status.
+#
+# /api/status answers as soon as the HTTP server is up, which is BEFORE kickstart has run
+# — and kickstart is what creates the API key this script authenticates with. On a fresh
+# database the two were observed three seconds apart:
+#
+#   02:39:40  container reports healthy, /api/status answers, this script runs and fails
+#   02:39:43  KickstartRunner - Created API key ending in [...]
+#
+# So waiting on /api/status proves the server is listening and nothing about whether the
+# key exists. The stack then failed its WaitCondition with every container healthy.
+#
+# This only bites on a fresh database, which is exactly what a clean create-stack is: on a
+# re-run kickstart is skipped because the database already has the key, the first attempt
+# succeeds, and the race is invisible. That is why incremental testing never caught it.
+#
+# 401/403 and connection-refused are the same case here — not ready yet — so poll the real
+# call and let it be the readiness check.
+tenants=""
 for _ in $(seq 1 60); do
-  curl -sf -o /dev/null "$BASE/api/status" && break
+  tenants=$(curl -sf -H "Authorization: $FUSIONAUTH_API_KEY" "$BASE/api/tenant") && break
   sleep 5
 done
-curl -sf -o /dev/null "$BASE/api/status" || { log "FusionAuth API never came up"; exit 1; }
-
-tenants=$(curl -sf -H "Authorization: $FUSIONAUTH_API_KEY" "$BASE/api/tenant") || {
-  log "could not list tenants — is the kickstart API key present?"; exit 1; }
+[ -n "$tenants" ] || {
+  log "could not list tenants after 5 min — did kickstart create the API key?"; exit 1; }
 
 read -r TENANT_ID CURRENT <<<"$(printf '%s' "$tenants" | python3 -c '
 import json, sys

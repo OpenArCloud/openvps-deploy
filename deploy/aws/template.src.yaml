@@ -29,21 +29,19 @@ Parameters:
     Default: geopose
     AllowedValues: [geopose, spatialdds]
     Description: >-
-      Which OpenVPS to deploy. `geopose` is the GeoPose Protocol service on openvps:main and
-      is exactly what this template deployed before the variant existed. `spatialdds` is the
-      SpatialDDS 1.7 VPS binding on the openvps:spatialdds branch, and additionally runs the
-      SpatialDDS web bridge. The variant chooses the upstream ref and the Compose overrides;
-      instance sizing, storage, idle shutdown and the waker are shared. Refs are pinned per
-      variant in the VariantConfig mapping — neither variant tracks a moving branch.
+      `geopose` is the GeoPose Protocol service on openvps:main, and is what this template
+      deployed before the variant existed. `spatialdds` is the SpatialDDS 1.7 VPS binding
+      on the openvps:spatialdds branch. The variant selects the upstream ref and the
+      Compose overrides; sizing, storage, idle shutdown and the waker are shared. See the
+      VariantConfig mapping — neither variant tracks a moving branch.
 
   DdsPeers:
     Type: String
     Default: ''
     Description: >-
-      spatialdds only, and optional. Space-separated unicast DDS peer addresses, e.g.
-      `udp/10.0.1.42`. A VPC does not carry multicast, so RTPS peer discovery across two
-      instances has to be unicast; leave empty for a single-host deployment, where discovery
-      over loopback works without peers. Ignored by the geopose variant.
+      spatialdds only, optional. Space-separated unicast DDS peers, e.g. `udp/10.0.1.42`.
+      A VPC carries no multicast, so cross-instance RTPS discovery must be unicast. Leave
+      empty for a single host, where loopback discovery needs no peers.
 
   VpcId:
     Type: AWS::EC2::VPC::Id
@@ -149,9 +147,9 @@ Parameters:
     Type: String
     Default: ''
     Description: >-
-      Override the variant's pinned upstream commit. Leave empty — the normal case — and the
-      ref comes from the VariantConfig mapping below, which pins each variant to a verified
-      commit. Set it only to test a specific commit, and pin it; do not name a branch.
+      Override the variant's pinned upstream commit. Leave empty (the normal case) to take
+      the ref from the VariantConfig mapping. Set only to test a specific commit, and give
+      a commit hash, not a branch.
   HlocRepo:
     Type: String
     Default: https://github.com/cvg/Hierarchical-Localization.git
@@ -169,24 +167,19 @@ Parameters:
 
 Mappings:
 
-  # Everything that differs between the two variants, in one table. Adding a variant means
-  # adding a row here plus a Compose override file; nothing else in the template branches on
-  # the variant name.
-  #
-  # Refs are commit hashes, never branch names. A branch would make two deployments of the
-  # "same" stack produce different software with no record of the difference.
+  # Everything that differs between the variants, in one table: adding a variant is a row
+  # here plus a Compose override. Refs are commit hashes, never branch names — a branch
+  # would let two deployments of the "same" stack run different software unrecorded.
   VariantConfig:
     geopose:
-      # openvps:main. Unchanged from before the variant existed, so a stack created with
-      # defaults today is byte-identical to one created before.
+      # openvps:main. Unchanged, so a defaults stack matches one created before variants.
       UpstreamRef: fc2f4706f8cd0340b22685aa67c4a9d63837f3f6
       ComposeFiles: '-f docker-compose.yaml -f /opt/openvps/docker-compose.aws.yaml'
       IdleExtraPorts: ''
       IdleExtraContainers: ''
     spatialdds:
-      # openvps:spatialdds. The branch currently carries no implementation, so this is the
-      # same commit as geopose and the two variants differ only by the Compose override.
-      # Bump it with each branch checkpoint that changes what runs.
+      # openvps:spatialdds. No implementation on the branch yet, so this is the same commit
+      # as geopose and the variants differ only by the Compose override. Bump per checkpoint.
       UpstreamRef: fc2f4706f8cd0340b22685aa67c4a9d63837f3f6
       ComposeFiles: '-f docker-compose.yaml -f /opt/openvps/docker-compose.aws.yaml -f /opt/openvps/docker-compose.spatialdds.yaml'
       # The web bridge's WebSocket port, so a connected browser client counts as activity.
@@ -281,12 +274,11 @@ Resources:
       FromPort: 8088
       ToPort: 8088
       SourceSecurityGroupId: !Ref WakerSecurityGroup
-      Description: SpatialDDS web bridge (HTTP + WebSocket), from the waker only
+      Description: SpatialDDS web bridge (HTTP + WS), from the waker only
 
   # RTPS between GPU hosts, for the two-instance discovery test. Source is this group
-  # itself, so it covers any instance in it and nothing outside the VPC. UDP 7400-7500 is
-  # Cyclone's default port range; TCP is here because a VPC carries no multicast, so a
-  # deployment that cannot use unicast UDP peers falls back to Cyclone's TCP transport.
+  # itself, so it covers members and nothing outside. 7400-7500 is Cyclone's default range;
+  # TCP is here for deployments that fall back to Cyclone's TCP transport.
   GpuIngressRtpsUdp:
     Type: AWS::EC2::SecurityGroupIngress
     Condition: IsSpatialDds
@@ -296,7 +288,7 @@ Resources:
       FromPort: 7400
       ToPort: 7500
       SourceSecurityGroupId: !Ref GpuSecurityGroup
-      Description: RTPS discovery and user traffic, between hosts in this group only
+      Description: RTPS discovery and user traffic, within this group only
 
   GpuIngressRtpsTcp:
     Type: AWS::EC2::SecurityGroupIngress
@@ -448,9 +440,8 @@ Resources:
         - {Key: Name, Value: !Sub '${AWS::StackName}-gpu'}
       UserData:
         Fn::Base64:
-          # Two-argument Fn::Sub: the second argument supplies the variant-derived values,
-          # which Mappings cannot reach through the short form. ${!Var} still escapes a
-          # literal shell variable exactly as before.
+          # Two-argument Fn::Sub: the second argument carries the variant-derived values,
+          # which Mappings cannot reach through the short form. ${!Var} escapes as before.
           Fn::Sub:
             - |
               #!/bin/bash
@@ -626,10 +617,9 @@ Resources:
               chmod 600 "${!BASE}/bootstrap.conf"
 
               # ---- variant ------------------------------------------------------------------
-              # The Compose file list lives in a conf file rather than being baked into the
-              # systemd unit, so the unit is one shared file across both variants and the
-              # variant is a single value in one place. systemd word-splits $COMPOSE_FILES
-              # from an EnvironmentFile, which is what turns this string back into flags.
+              # The Compose file list goes in a conf file rather than the systemd unit, so
+              # the unit is shared and the variant lives in one place. systemd word-splits
+              # $COMPOSE_FILES from an EnvironmentFile, turning this back into flags.
               echo "variant: ${!VARIANT}"
               echo "upstream ref: ${!UPSTREAM_REF}"
               cat > "${!BASE}/compose.conf" <<CONF
@@ -655,9 +645,8 @@ Resources:
               systemctl enable openvps-auth.service openvps.service
 
               # ---- idle shutdown (Phase 3) --------------------------------------------------
-              # EXTRA_PORTS and EXTRA_CONTAINERS are how the variant extends the shared idle
-              # detector rather than replacing it: the spatialdds variant adds the web
-              # bridge's port and container so a connected browser client reads as activity.
+              # EXTRA_PORTS/EXTRA_CONTAINERS extend the shared idle detector rather than
+              # replacing it; spatialdds adds the web bridge so a browser reads as activity.
               cat > "${!BASE}/idle.conf" <<CONF
               IDLE_MINUTES=${!IDLE_MIN}
               MAPS_DIR=${!MAPS_DIR}
@@ -755,6 +744,6 @@ Outputs:
   WebBridgeEndpoint:
     Condition: IsSpatialDds
     Description: >-
-      Reachable from the waker security group only. The waker needs a Caddy route to this
-      before a browser client can use it — see README, "The spatialdds variant".
+      Reachable from the waker security group only. Needs a Caddy route on the waker before
+      a browser can use it — see README, "The spatialdds variant".
     Value: !Sub 'http://${Instance.PrivateIp}:8088'
