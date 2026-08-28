@@ -181,12 +181,15 @@ Mappings:
       IdleExtraPorts: ''
       IdleExtraContainers: ''
     spatialdds:
-      # openvps:spatialdds @ fc2f470. That IS the branch head — the branch is ten commits
-      # behind main and carries nothing of its own yet, so this is deliberately NOT bumped
-      # with geopose. The variants now pin different commits, which they did not before.
-      # Because fc2f470 predates the DEFAULT_* removal, docker.env still writes those three
-      # variables; they are unreferenced on b2dff1f and harmless there.
-      UpstreamRef: fc2f4706f8cd0340b22685aa67c4a9d63837f3f6
+      # openvps:spatialdds. The branch is now main plus the SpatialDDS 1.7 VPS binding: the
+      # localizer joins DDS, serves vps_query/vps_response and announces itself, and the web
+      # bridge carries the same types to browsers. It is a fast-forward of main, so it
+      # includes the DEFAULT_* removal and neither variant reads those variables any more.
+      #
+      # This ref is what the instance clones, so it has to exist on GitHub. The branch and
+      # this pin move together in one commit: a pin naming an unpushed commit fails at
+      # checkout, and a pin left behind silently deploys code the branch has moved past.
+      UpstreamRef: 21fd807d082fc5d5d0c364b603bf28b499e5cc79
       ComposeFiles: '-f docker-compose.yaml -f /opt/openvps/docker-compose.aws.yaml -f /opt/openvps/docker-compose.spatialdds.yaml'
       # The web bridge's WebSocket port, so a connected browser client counts as activity.
       IdleExtraPorts: '8088'
@@ -434,7 +437,7 @@ Resources:
             },
             "/opt/openvps/docker-compose.spatialdds.yaml": {
               "mode": "0644",
-              "gz64": "H4sIAAAAAAACE3WRUWuDMBSF3/0Voe8aH0fAh6wVJlgV6wbbi6Txbg2NicTM1v36xbq1Q7qHQO659zu5h3iKtUCQ7kANXe95PZhBcOiJh9Ce8SOoZroiBGdrWH3Qve1nASEfraY6aLSbM4FQFoxikkyi/8EsnNi4mmE1CKNVC8re4C0t0nxN0+QtLuvnMo0O1nYE47ueD2EYeg5tWSc1Z1J8gZmtFNiTNse61Y0LMsEXedDys4U/u2LdWfyTE/ORS62gafrg3EqCwfKlZvQNHZjBUux/cbIU/g+5fl2neRZvNjsXMYnehQQX8c57V2JX0Cqh6URcTr6lSRaF135exNlLMTefYlpWjzGtouVGWDL3Cc7bZ9yKQdjR+waIQugN6wEAAA=="
+              "gz64": "H4sIAAAAAAACE7VUUW/aMBB+51dYeZwWDJ2qVZHyEEjURUpJFGinbZoik7jg4diRbQJ02n/fhSSUtaxPGwjh3N135+/uyw0EKamDZEVFXenBQFNVs5xqZ4DQkuQbKormiBDdG0WytdRGtwaEbGQ1z8NCQpwaMmGoEoQ7jdFeEUN35GC1YFEzJUVJhXkG33lJFE+9KPwapNl9GrlrYyoH44s5b0aj0QCgJam4zAlnT1S1qQQ1O6k2WSkLINKAj+Za8m1Jz+6KZWVwxxPnh5xLQYtCD/cldzA1+Uubks/QmijM2bKHOy8Nfyc5/TKN4lng+3OgGLqPjFOgeKHeCTFPvEXoRQ3i+IvvvHDmjk7+OAlmD0nr/BR46WISeAv35Y0wJzAEyG2T3LCamcPFBMHMm0SB745feedB+hBOgyz0XV3nTsNaEpVjstO2oV2TzwFxeus2Ec2UdnS5VKxY0bYRyy3jRd+TXMJM98ZBw87QjvrYGdSiNIYEWXvG/sk96OGECaqyP5Rrn0ra47dkUVCIL3QmRX+f14rqyhTMMAhD3SuRrSnhZn34p+q6qJkzBSxSbzZP4nThAvA/iurMP4njxRzqJm9HpaF/G2ReFMWfs+R+EoXzT52K2j7la5pvek6NYBz0zZre+dZ7ZOVbxZt/2xayUnJ/aB7etZZHwjqfBlrCtGe5NdX2eMYFrbHYcgg6Dev4sbr1Mb76OBzBdww74+YGD3eUc3sj5E5gXRHDCIfm4KWURsNGq6zvXZrjqqlh1aDxqG+1YSWF0g667i2KGsVg8Gh81Vm0IcpkFVVMFg760GG5XK2YWPUNKBSrQV7oh5bCPmkZgXobjUG6nyXZA+Mn0Kp1PSqBaWNoXwrr2vo1+A0Xc59KqQUAAA=="
             },
             "/opt/openvps/cyclonedds.xml.in": {
               "mode": "0644",

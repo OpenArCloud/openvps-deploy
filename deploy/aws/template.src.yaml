@@ -181,12 +181,15 @@ Mappings:
       IdleExtraPorts: ''
       IdleExtraContainers: ''
     spatialdds:
-      # openvps:spatialdds @ fc2f470. That IS the branch head — the branch is ten commits
-      # behind main and carries nothing of its own yet, so this is deliberately NOT bumped
-      # with geopose. The variants now pin different commits, which they did not before.
-      # Because fc2f470 predates the DEFAULT_* removal, docker.env still writes those three
-      # variables; they are unreferenced on b2dff1f and harmless there.
-      UpstreamRef: fc2f4706f8cd0340b22685aa67c4a9d63837f3f6
+      # openvps:spatialdds. The branch is now main plus the SpatialDDS 1.7 VPS binding: the
+      # localizer joins DDS, serves vps_query/vps_response and announces itself, and the web
+      # bridge carries the same types to browsers. It is a fast-forward of main, so it
+      # includes the DEFAULT_* removal and neither variant reads those variables any more.
+      #
+      # This ref is what the instance clones, so it has to exist on GitHub. The branch and
+      # this pin move together in one commit: a pin naming an unpushed commit fails at
+      # checkout, and a pin left behind silently deploys code the branch has moved past.
+      UpstreamRef: 21fd807d082fc5d5d0c364b603bf28b499e5cc79
       ComposeFiles: '-f docker-compose.yaml -f /opt/openvps/docker-compose.aws.yaml -f /opt/openvps/docker-compose.spatialdds.yaml'
       # The web bridge's WebSocket port, so a connected browser client counts as activity.
       IdleExtraPorts: '8088'

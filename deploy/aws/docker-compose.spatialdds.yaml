@@ -6,12 +6,9 @@
 # docker-compose.yaml and docker-compose.aws.yaml, never instead of them, so the HLOC cache
 # volume, the healthchecks and the log rotation all still apply.
 #
-# The web bridge service is not here yet. It is vendored into openvps:spatialdds in Phase 3,
-# and Compose cannot reference a build context that does not exist. Everything around it is
-# already in place and inert: the 8088 security group rule, the idle detector's extra port
-# and container, the WebBridgeEndpoint output. The service block to paste in, and the one
-# environment variable that is easy to get wrong, are in the README under
-# "The spatialdds variant".
+# The web bridge carries SpatialDDS types to browser clients, which cannot speak RTPS. It is
+# a transport adapter, not a protocol bridge: the payloads are SpatialDDS on both sides and
+# nothing translates to or from GeoPose Protocol.
 
 name: openvps
 
@@ -43,3 +40,48 @@ services:
       - CYCLONEDDS_URI=file:///etc/cyclonedds.xml
       - SPATIALDDS_DDS_DOMAIN=0
       - OPENVPS_DDS_HEARTBEAT=/var/lib/openvps/last-dds-activity
+      # The participant is off unless this is set, so the localizer image is identical
+      # either way and the geopose variant is unaffected by anything on the branch.
+      - OPENVPS_DDS_ENABLED=1
+      # The persistent half of the service identity; the announcer appends ;v=<map_id> as
+      # the revision, so a map swap is legibly the same service at a new revision.
+      - OPENVPS_SERVICE_ID=svc:vps:oarc/aws-test
+      - OPENVPS_ORG=oarc
+
+  webbridge:
+    build:
+      # The repository root, not bridges/web_bridge: the image shares the vendored
+      # SpatialDDS packages with the localizer and has to keep the demo's module layout,
+      # because __main__.py runs uvicorn against "bridges.web_bridge.server:app".
+      context: .
+      dockerfile: bridges/web_bridge/Dockerfile
+    container_name: openvps-webbridge-1
+    # Same reason as the localizer: RTPS advertises the address it binds, and a bridged
+    # container advertises one no off-host peer can route to.
+    network_mode: host
+    depends_on:
+      maplocalizer:
+        condition: service_healthy
+    volumes:
+      - /opt/openvps/cyclonedds.xml:/etc/cyclonedds.xml:ro
+    environment:
+      - SPATIALDDS_TRANSPORT=dds
+      - CYCLONEDDS_URI=file:///etc/cyclonedds.xml
+      - SPATIALDDS_DDS_DOMAIN=0
+      # Must equal SPATIALDDS_DDS_DOMAIN. The bridge serves its bootstrap document from the
+      # SPATIALDDS_BOOTSTRAP_* variables, which default to domain 1; set only the DDS domain
+      # and the deployment advertises a domain it does not publish on, so a client following
+      # this service's own bootstrap joins an empty domain and sees nothing, with no error
+      # on either side. The demo shipped exactly that and fixed it in eb20877.
+      - SPATIALDDS_BOOTSTRAP_DOMAIN=0
+      - SPATIALDDS_BRIDGE_ALLOW_PUBLISH=1
+    healthcheck:
+      test: ["CMD", "curl", "--noproxy", "*", "--fail", "--silent", "--output", "/dev/null",
+             "http://127.0.0.1:8088/.well-known/spatialdds/bootstrap"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    logging:
+      driver: json-file
+      options: {max-size: "50m", max-file: "5"}
