@@ -172,14 +172,20 @@ Mappings:
   # would let two deployments of the "same" stack run different software unrecorded.
   VariantConfig:
     geopose:
-      # openvps:main. Unchanged, so a defaults stack matches one created before variants.
-      UpstreamRef: fc2f4706f8cd0340b22685aa67c4a9d63837f3f6
+      # openvps:main @ b2dff1f (2026-08-27). Tested end to end on this commit: a real
+      # 2143-frame scan mapped and localized. Note this moved the two GPU images to
+      # CUDA 12.9 / Ubuntu 24.04 and dropped DEFAULT_LONGITUDE/LATITUDE/HEIGHT from the
+      # Compose file. See NOTES.md.
+      UpstreamRef: b2dff1f8d10ea11d8d7cf75c0da073e555c6db2a
       ComposeFiles: '-f docker-compose.yaml -f /opt/openvps/docker-compose.aws.yaml'
       IdleExtraPorts: ''
       IdleExtraContainers: ''
     spatialdds:
-      # openvps:spatialdds. No implementation on the branch yet, so this is the same commit
-      # as geopose and the variants differ only by the Compose override. Bump per checkpoint.
+      # openvps:spatialdds @ fc2f470. That IS the branch head — the branch is ten commits
+      # behind main and carries nothing of its own yet, so this is deliberately NOT bumped
+      # with geopose. The variants now pin different commits, which they did not before.
+      # Because fc2f470 predates the DEFAULT_* removal, docker.env still writes those three
+      # variables; they are unreferenced on b2dff1f and harmless there.
       UpstreamRef: fc2f4706f8cd0340b22685aa67c4a9d63837f3f6
       ComposeFiles: '-f docker-compose.yaml -f /opt/openvps/docker-compose.aws.yaml -f /opt/openvps/docker-compose.spatialdds.yaml'
       # The web bridge's WebSocket port, so a connected browser client counts as activity.

@@ -57,7 +57,9 @@ services:
     healthcheck:
       # curl is installed in this image by the upstream Dockerfile. Address 127.0.0.1
       # rather than localhost — see the note on the frontend check below.
-      test: ["CMD", "curl", "--noproxy", "*", "--fail", "--silent", "--output", "/dev/null", "http://127.0.0.1:8000/"]
+      # /health exists as of upstream b2dff1f and reports loaded maps and the current map;
+      # it is a truer readiness signal than the bare root page.
+      test: ["CMD", "curl", "--noproxy", "*", "--fail", "--silent", "--output", "/dev/null", "http://127.0.0.1:8000/health"]
       interval: 10s
       timeout: 5s
       retries: 12

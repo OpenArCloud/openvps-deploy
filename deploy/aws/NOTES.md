@@ -1306,3 +1306,88 @@ maps costs cents rather than $16. The test volume here held one 2143-frame scan,
 Keeping the *root* volume is the only thing that avoids the 25-minute rebuild, and that is
 the expensive half of the $32. Whether that is worth $16/month depends on how often the host
 wakes — at daily use it plainly is, which is exactly what the idle-shutdown design assumes.
+
+---
+
+## Upstream bump: `fc2f470` → `b2dff1f` (2026-08-27), tested end to end
+
+Ten commits. Re-ran the full test on `g4dn.2xlarge`: real 2143-frame scan, uploaded through
+the API with a genuine session, mapped, and localized.
+
+| | `fc2f470` | `b2dff1f` |
+|---|---|---|
+| Build | 24 m 35 s | 26 m 03 s |
+| `openvps-backend` | 41.5 GB | 44.8 GB |
+| `openvps-maplocalizer` | 40.7 GB | 44.1 GB |
+| Root disk used | 111 GiB | 115 GiB |
+| Registered images | 82 | 82 |
+| points3D | 14,858 | 14,885 |
+| Mean reprojection error | 1.220 px | 1.221 px |
+| `hlocMapBuild` | 166.0 s | 193.3 s |
+| Mapping total | 195.7 s | 217.7 s |
+| Localization | 3/3, ~3.1 s | 3/3, ~3.0 s |
+
+Both GPU images moved from CUDA 11.8 / Ubuntu 22.04 to **CUDA 12.9 / Ubuntu 24.04**, now
+build into a venv at `/opt/venv`, and hloc moved from `/app/hloc` to
+`/app/Hierarchical-Localization`. That costs ~8 % on image size and ~6 % on build time. The
+200 GB root default still holds: 115 GiB steady state plus ~71 GiB of transient build cache
+is 186 GiB. `torch` is still pinned to 2.4.1 and still reports `cu121` — it bundles its own
+CUDA runtime, so the newer base image does not change what torch links against.
+
+### One documented trap is now fixed upstream
+
+A new `hlocMapScaleEstimation` stage runs `hloc_metric_alignment.py`, which **writes
+`transform.json` automatically**, deriving a metric scale (0.2417 here) from the
+StrayScanner prior poses. Map selection now works with no manual transform POST. The
+previous note that a map cannot be served until someone supplies a georeference no longer
+applies to the scale part of it.
+
+### The localize response contract changed
+
+`POST /localize/geopose` now returns `poses` and `geoposes` arrays alongside `geopose`. The
+auto-written transform has `latitude/longitude/height: null` — a map has no geo anchor until
+MapAligner georeferences it — so `geopose` comes back zeroed and `geoposes` is empty, and the
+useful output is `poses[0].pose.t` in the map's own frame.
+
+Any client expecting lat/lon from a freshly built map will get zeros. That is the
+"no default georeference" change behaving as designed, but it is a contract change worth
+knowing before pointing a client at it.
+
+### Accuracy, and a correction to how it was first measured
+
+`poses` are returned in the map's own (reconstruction) frame: **no metric scale and no
+graphics→ENU rotation applied**. The first version of the evaluation applied both, and
+reported 2.7–4 m of error. That was entirely an artefact of the comparison — the returned
+values were exactly `1/0.2417` times the expected ones, which is what gave it away.
+
+Compared in the right frame:
+
+| frame | latency | error |
+|---|---|---|
+| frame_0633 | 2.29 s | 3.44 mm |
+| frame_1067 | 3.83 s | 3.75 mm |
+| frame_1680 | 2.86 s | 9.10 mm |
+
+Mean 5.43 mm in map units, 0.13 cm metric. Same caveat as before: the query frames came from
+the map, so this is self-consistency rather than generalisation.
+
+### What changed in this repository
+
+- `geopose` variant pinned to `b2dff1f`. **`spatialdds` deliberately left at `fc2f470`** —
+  that IS the branch head, ten commits behind main with nothing of its own. The two variants
+  now pin different commits for the first time.
+- `DEFAULT_LONGITUDE/LATITUDE/HEIGHT` were dropped from upstream's Compose file at
+  `b2dff1f`, so the CFN parameters are dead for `geopose`. They were **kept** because
+  `fc2f470` still references them and removing them would break the `spatialdds` variant.
+- `nginx/mapbuilder.conf` re-derived from the new upstream and verified location-by-location.
+  Upstream added access logging with the `main` format and turned it **off for
+  `/socket.io/`**, so socket.io traffic is now invisible to the idle detector: a user
+  watching a build produces no access-log lines, and the GPU-process and maps-write
+  conditions are what cover that. Upstream's file-based log was not adopted — it grows
+  unbounded inside the container.
+- MapLocalizer healthcheck moved to the new `/health`, which reports loaded maps and the
+  current map rather than just serving a page.
+
+**When bumping the pin, re-derive `nginx/mapbuilder.conf`.** It is copied into the frontend
+image at build time and we mount a modified copy over it, so it is the one file that drifts
+silently.

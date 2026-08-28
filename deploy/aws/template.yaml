@@ -172,14 +172,20 @@ Mappings:
   # would let two deployments of the "same" stack run different software unrecorded.
   VariantConfig:
     geopose:
-      # openvps:main. Unchanged, so a defaults stack matches one created before variants.
-      UpstreamRef: fc2f4706f8cd0340b22685aa67c4a9d63837f3f6
+      # openvps:main @ b2dff1f (2026-08-27). Tested end to end on this commit: a real
+      # 2143-frame scan mapped and localized. Note this moved the two GPU images to
+      # CUDA 12.9 / Ubuntu 24.04 and dropped DEFAULT_LONGITUDE/LATITUDE/HEIGHT from the
+      # Compose file. See NOTES.md.
+      UpstreamRef: b2dff1f8d10ea11d8d7cf75c0da073e555c6db2a
       ComposeFiles: '-f docker-compose.yaml -f /opt/openvps/docker-compose.aws.yaml'
       IdleExtraPorts: ''
       IdleExtraContainers: ''
     spatialdds:
-      # openvps:spatialdds. No implementation on the branch yet, so this is the same commit
-      # as geopose and the variants differ only by the Compose override. Bump per checkpoint.
+      # openvps:spatialdds @ fc2f470. That IS the branch head — the branch is ten commits
+      # behind main and carries nothing of its own yet, so this is deliberately NOT bumped
+      # with geopose. The variants now pin different commits, which they did not before.
+      # Because fc2f470 predates the DEFAULT_* removal, docker.env still writes those three
+      # variables; they are unreferenced on b2dff1f and harmless there.
       UpstreamRef: fc2f4706f8cd0340b22685aa67c4a9d63837f3f6
       ComposeFiles: '-f docker-compose.yaml -f /opt/openvps/docker-compose.aws.yaml -f /opt/openvps/docker-compose.spatialdds.yaml'
       # The web bridge's WebSocket port, so a connected browser client counts as activity.
@@ -420,11 +426,11 @@ Resources:
           "files": {
             "/opt/openvps/nginx/mapbuilder.conf": {
               "mode": "0644",
-              "gz64": "H4sIAAAAAAACE6VUTW/bMAy951cQXc+x2izb0GCHopdhxxa77CIoNh0LtUWVkotkQ//7aFlNgjbtYJSwbEt85OOXPQvIj8jwdwYirQ0RHYzyTa3S4YjQznQIoFezdHiP6E1rH1FH2yH1Eb4u5crasrXoou7MVq+p2ulg/yBkd55pu9OMDz2GqNd9XSNbtwGq62z9jDDV3rnI4otS4dhFQPcWIPMn7gMiA8ZMqTTRkoMipz4IEw24wni/2h9aV+E2P+ZN7NpR9TT6QWZi7c1GagNLpWRdylrI+iyelurYZk/6/aA5Qd8HLkJjGAu3sW5bvCI9BB+ovMc4t3Scxlgeb0KQTROjvyqKtRGgq64WSqkjq9UJo31vGukAcgByL2GDUy1DEYYgLuYXL/UBn63hl9+wvMB5sunH3Tv4G3IOy5TdWUafvQP/QSGKb7m/UaHO+DCpOMlgUl1Ock6l/Bhj71sy1V1ks7vFkriSL+q39ROC+Bi/6WMzqcrJ4P99HWYmNRc+yWQwy2TAsE8/o5oYrsXP/OcdlKZtB4KQ43ua/QMdJ75t2gQAAA=="
+              "gz64": "H4sIAAAAAAACE6VUsW7bMBDd/RWHNLPJxHVbxOgQZCk6JujShaClk0REIhkeZdgt8u89UbQtpE4CI4Qoibx375HvKM0IwwYD/J0Bt9ZQRAtj+yZXaXJEKKs7BFCrWZrURYFEqnU1iBI3gmLp+gidNjYjHhG9bs0GVTQdDsGvS75ytGgN2qg6vVVrV+4UmT8IWdAHt92pgE89UlTrvqowGFuDq6qcvUfo8kDObfFFSppSENrXAFk/aR8RGTB64QodjbMgsjlDC84NOKG9Xx0mjS1xmx/zJnbtGHoeeTAEF5TXNbsHSym5X3NfcP/MTEs5zTmIfj9GTsj3FAQ1OqCwtbFb8Z/ocfHkikeMc+Om25hUL5m6nx9t85qIB02M/kaItWYCW94spJQTtlNJh5o1XBkMBM6+hA2kio8TDYu7ml+9jBPus+GXrwO/wGXK6cfRG/g7Zy0WadcXGX3xBvyHo8jcfH/FuU57mpr2rjkp4SxfTmqeK/kxxd63TpcPMejdPRYulPyl/Tb+jEV8TF/3sTnL5ZTwfl2HM5OKC5/4ZITAJwOGcfqNVS7ALfPMfz5Aodt2EKC8vufZP8Kg+f0UBQAA"
             },
             "/opt/openvps/docker-compose.aws.yaml": {
               "mode": "0644",
-              "gz64": "H4sIAAAAAAACE7VUTW+cMBC98ytGHHKICoZE20a+ptfeequqlWMGcGM8rm3Itr++A2vaVOqmUpUKyYzffHjeY0zh1IQSyKNbfCyKU6WeoqUhSrjKVgHQBbNgkPAlkqt6Y5Ex8smQi5JNgEmdqmi+c6Xy0EzlT2yNXbGyKCKGxWjcEh6UfkTXnXMXsvOEuRBABaMlfdRKjyhFIEqi3jYiUdDjFsVtDcYNEq73Hov1PM+JynIb4Z8rj6hsGhnTj3tawpgkfCrvP7wv30Cp52DXd1U58oFO39bN9Rnplcm+yMRdOts0Jz9vtuhwEW62W9CYkpdCtDfv6oafVt41TSPKz/lY4xIrpqyEtol7K2ZCribhsCMBUzBMEdqbjMSkQjp6DIY6CW9z7iXFWK7B7Xr9nfzTgJnU19nsZvSmw7DZH9f18Ed2t03Til7xDJCreXllorcvEe0D8SEXB07wLIt8BYTj9JNgaR5mY5lXzf32UmDS2bXu644/Za9mm87uQP9fwLtXH472cFGzZxo9uzRb9G9/jOMvb/EDR33llEwEAAA="
+              "gz64": "H4sIAAAAAAACE7VUTW+cMBC98yssDjlEBZtE20a+ptfccouilWMGcGM8rm3Itr++A5g2lbqpVKVCMuM3H573GFM4NYJk6MHNPhbFqVIv0WIfJbvIVsFYG8wMQbIvEV3VGQuEoU8GXZRkMjaqUxXNd6pUHsRY/sSW2AUriyJCmI2GNeFJ6Wdw7ZY7o51GyIUYq9hgUR+10gNIHhATr9cNTxj0sEZRW71xvWSXe4/Fcp6nRGWpjfDPlQdQNg2E6ec9LUFMkj2Ut3efyw+s1FOwy7uqHPqAp2/L5nJDOmWyLxJxlzYbp+Sn1eYtzNxNdg0aUvKS8+bqUy3oaeSNEIJvDZSP+XDjEummrGSNiHtDZgSqKdlhRwKkYIgoa64yEpMK6eghGGwl+5hzz+lGovVuV+3vErz0kKl9ncxuRm9aCKt9v6yHP3K8FqLhnaJJQFfT8s5Er98i2gWkQ86OHaeJ5vkicEfpJ07SPE3GEq+a+u0kh6Sza9nXLX3QTk02be6A/1/AG8HfWbPmcFazVxq9ujpr9G//jeMvb/EDfwHZM1IEAAA="
             },
             "/opt/openvps/docker-compose.spatialdds.yaml": {
               "mode": "0644",
