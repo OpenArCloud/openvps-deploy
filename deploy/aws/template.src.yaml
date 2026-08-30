@@ -189,7 +189,7 @@ Mappings:
       # This ref is what the instance clones, so it has to exist on GitHub. The branch and
       # this pin move together in one commit: a pin naming an unpushed commit fails at
       # checkout, and a pin left behind silently deploys code the branch has moved past.
-      UpstreamRef: b1a5892100f5e3a46cee80cb487c330b8accda02
+      UpstreamRef: 1a608af79b54ef9552c235013b231e75ac06f280
       ComposeFiles: '-f docker-compose.yaml -f /opt/openvps/docker-compose.aws.yaml -f /opt/openvps/docker-compose.spatialdds.yaml'
       # The web bridge's WebSocket port, so a connected browser client counts as activity.
       IdleExtraPorts: '8088'
