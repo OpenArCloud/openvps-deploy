@@ -172,11 +172,15 @@ Mappings:
   # would let two deployments of the "same" stack run different software unrecorded.
   VariantConfig:
     geopose:
-      # openvps:main @ b2dff1f (2026-08-27). Tested end to end on this commit: a real
-      # 2143-frame scan mapped and localized. Note this moved the two GPU images to
-      # CUDA 12.9 / Ubuntu 24.04 and dropped DEFAULT_LONGITUDE/LATITUDE/HEIGHT from the
-      # Compose file. See NOTES.md.
-      UpstreamRef: b2dff1f8d10ea11d8d7cf75c0da073e555c6db2a
+      # openvps:main @ dd8df87 (PR #16, pipeline settings). Tested end to end on this
+      # commit: a real 2143-frame scan mapped and localized.
+      #
+      # PR #16 added a /settings/ route to upstream's nginx.conf. This deployment mounts its
+      # own copy of that file over the image's, so the route had to be added there by hand
+      # (nginx/mapbuilder.conf) — without it the new settings UI 404s on a feature that
+      # works locally. That file is the one that drifts silently; re-derive it whenever
+      # upstream touches nginx.conf.
+      UpstreamRef: dd8df87d756e1417a66d4ea76c19c18cb02d8812
       ComposeFiles: '-f docker-compose.yaml -f /opt/openvps/docker-compose.aws.yaml'
       IdleExtraPorts: ''
       IdleExtraContainers: ''
@@ -429,7 +433,7 @@ Resources:
           "files": {
             "/opt/openvps/nginx/mapbuilder.conf": {
               "mode": "0644",
-              "gz64": "H4sIAAAAAAACE6VUsW7bMBDd/RWHNLPJxHVbxOgQZCk6JujShaClk0REIhkeZdgt8u89UbQtpE4CI4Qoibx375HvKM0IwwYD/J0Bt9ZQRAtj+yZXaXJEKKs7BFCrWZrURYFEqnU1iBI3gmLp+gidNjYjHhG9bs0GVTQdDsGvS75ytGgN2qg6vVVrV+4UmT8IWdAHt92pgE89UlTrvqowGFuDq6qcvUfo8kDObfFFSppSENrXAFk/aR8RGTB64QodjbMgsjlDC84NOKG9Xx0mjS1xmx/zJnbtGHoeeTAEF5TXNbsHSym5X3NfcP/MTEs5zTmIfj9GTsj3FAQ1OqCwtbFb8Z/ocfHkikeMc+Om25hUL5m6nx9t85qIB02M/kaItWYCW94spJQTtlNJh5o1XBkMBM6+hA2kio8TDYu7ml+9jBPus+GXrwO/wGXK6cfRG/g7Zy0WadcXGX3xBvyHo8jcfH/FuU57mpr2rjkp4SxfTmqeK/kxxd63TpcPMejdPRYulPyl/Tb+jEV8TF/3sTnL5ZTwfl2HM5OKC5/4ZITAJwOGcfqNVS7ALfPMfz5Aodt2EKC8vufZP8Kg+f0UBQAA"
+              "gz64": "H4sIAAAAAAACE6VUsW7bMBDd/RWHNLPF1HVbxOhQdAkyJujShaClk0REIlkeZdgt8u89UbQspE4CwYQoibx375GPJy0I/Q49/F0At0ZTQAND+yo2cXJASKNaBJCbRZxUeY5EsrEVZAXuMgqF7QK0SpuEeEJ0qtE7lEG32Ae/rPlK0bzRaIJs1V5ubXGQpP8gJEHn7f4gPf7ukILcdmWJXpsKbFmm7CNCFSM5t9VnIWhKQWheAyT9qH1CJMDghc1V0NZAlszpm7e2x2XKuc04qU2B+/RY1qFthtDzwIPeWy+dqtg9WAvB/SP3FfdPzLQW05xR9Nspcka+I59RrTxmptJmn/0nelo82fwJw1Lb6TYmpxdNPc4PtjlFxIM6BHebZVvFBKa4XQkhJmznksYzq/lk0BNY8xLWk0ouJ+oXd7O8eRknPGbDT1d5foHrmNMNozfwP6wxmMddXyX01RvwO0uBufn+inOtcjQ17V1zYsIsX85qzpW8TJEdCfxxzdvpmHSZducaq4rH4NXhAXPrC+b8pd2MlVymr7pQz9p3THi/pvp6jYUFH7gqveeqhH4cf6Gl9fCdeZb3j5CrpukFKK3vefEPWtBrtJAFAAA="
             },
             "/opt/openvps/docker-compose.aws.yaml": {
               "mode": "0644",

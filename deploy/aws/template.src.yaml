@@ -172,11 +172,15 @@ Mappings:
   # would let two deployments of the "same" stack run different software unrecorded.
   VariantConfig:
     geopose:
-      # openvps:main @ b2dff1f (2026-08-27). Tested end to end on this commit: a real
-      # 2143-frame scan mapped and localized. Note this moved the two GPU images to
-      # CUDA 12.9 / Ubuntu 24.04 and dropped DEFAULT_LONGITUDE/LATITUDE/HEIGHT from the
-      # Compose file. See NOTES.md.
-      UpstreamRef: b2dff1f8d10ea11d8d7cf75c0da073e555c6db2a
+      # openvps:main @ dd8df87 (PR #16, pipeline settings). Tested end to end on this
+      # commit: a real 2143-frame scan mapped and localized.
+      #
+      # PR #16 added a /settings/ route to upstream's nginx.conf. This deployment mounts its
+      # own copy of that file over the image's, so the route had to be added there by hand
+      # (nginx/mapbuilder.conf) — without it the new settings UI 404s on a feature that
+      # works locally. That file is the one that drifts silently; re-derive it whenever
+      # upstream touches nginx.conf.
+      UpstreamRef: dd8df87d756e1417a66d4ea76c19c18cb02d8812
       ComposeFiles: '-f docker-compose.yaml -f /opt/openvps/docker-compose.aws.yaml'
       IdleExtraPorts: ''
       IdleExtraContainers: ''
