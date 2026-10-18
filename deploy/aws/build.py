@@ -92,6 +92,34 @@ def _odd_single_quotes(line: str) -> bool:
     return n % 2 == 1
 
 
+def _gzip_deterministic(raw: bytes) -> bytes:
+    """gzip bytes that do not depend on which interpreter ran the build.
+
+    `mtime=0` already pinned the timestamp, which was the obvious source of drift. The one
+    left is byte 9, the OS field of the gzip header, and it is interpreter-dependent:
+
+        Python 3.9.6, 3.10.12, 3.13.9   ->  0xff  ("unknown")
+        Python 3.12.8                   ->  0x13
+
+    Nothing else differs. Measured over this repository's own payloads: with byte 9
+    normalised, all four interpreters produce a byte-identical stream, so the deflate output
+    itself is stable and the header was the whole of it.
+
+    That mattered because `--check` compares bytes, so it was green only under 3.12.x and
+    reported every other interpreter's correct output as stale. Normalising here fixes the
+    cause rather than teaching the check to tolerate it: the artifact becomes reproducible
+    by anyone, which is what a checked-in generated file has to be.
+
+    0xff is the gzip spec's "unknown", which is the honest claim for a build artifact that
+    should not record the machine that made it — and it is what three of the four
+    interpreters already wrote, so the odd one out was the one that produced the committed
+    template.
+    """
+    z = bytearray(gzip.compress(raw, mtime=0))
+    z[9] = 0xFF
+    return bytes(z)
+
+
 def strip_comments(rel: str, raw: bytes) -> bytes:
     """Drop whole-line comments from a shipped payload.
 
@@ -210,7 +238,7 @@ def build(validate_payloads: bool = True) -> str:
         raw = strip_comments(rel, original)
         files[dest] = {
             "mode": mode,
-            "gz64": base64.b64encode(gzip.compress(raw, mtime=0)).decode(),
+            "gz64": base64.b64encode(_gzip_deterministic(raw)).decode(),
         }
 
     if validate_payloads:
@@ -221,19 +249,46 @@ def build(validate_payloads: bool = True) -> str:
     return src.replace(PLACEHOLDER, block)
 
 
+def _payloads(text: str) -> dict:
+    """dest path -> decompressed payload, for a template's embedded files block."""
+    out = {}
+    for m in re.finditer(r'"(/[^"]+)":\s*\{\s*"mode":\s*"[^"]*",\s*"gz64":\s*"([^"]+)"',
+                         text):
+        out[m.group(1)] = gzip.decompress(base64.b64decode(m.group(2)))
+    return out
+
+
 def main() -> None:
     out = build()
     if "--check" in sys.argv:
-        if not OUT.exists() or OUT.read_text() != out:
-            sys.exit("template.yaml is stale — run: python3 deploy/aws/build.py")
+        if not OUT.exists():
+            sys.exit("template.yaml is missing — run: python3 deploy/aws/build.py")
+        have = OUT.read_text()
+        if have != out:
+            # Say which payloads actually changed, not just that the bytes differ. A check
+            # that reports "stale" when only the envelope moved sends people hunting for a
+            # content change that is not there — which is exactly what the interpreter-
+            # dependent gzip header used to do.
+            a, b = _payloads(have), _payloads(out)
+            moved = sorted(k for k in set(a) | set(b) if a.get(k) != b.get(k))
+            detail = ("embedded payloads that differ: " + ", ".join(moved)) if moved else \
+                     ("no embedded payload differs — the change is in the template text "
+                      "itself, or in the generator")
+            sys.exit(f"template.yaml is stale — run: python3 deploy/aws/build.py\n  {detail}")
         print("template.yaml is up to date")
         return
     OUT.write_text(out)
     raw_total = sum(len(strip_comments(r, (HERE / r).read_bytes())) for r in FILES)
-    print(f"wrote {OUT} ({len(out)} bytes; {len(FILES)} files, "
+    # Bytes of the encoded template, not characters of the string. CloudFormation counts
+    # the bytes it receives, and `out` is UTF-8 on the way to disk; this template carries
+    # 15 em-dashes, so `len(out)` understated it by 30 bytes and overstated the headroom by
+    # the same. Immaterial at 3.6 KB of headroom and not at six, which this template has
+    # been down to once.
+    size = len(out.encode())
+    print(f"wrote {OUT} ({size} bytes; {len(FILES)} files, "
           f"{raw_total} bytes of payload compressed in after comment stripping)")
-    if len(out) > 51200:
-        print(f"WARNING: {len(out)} bytes exceeds the 51200-byte direct create-stack limit;"
+    if size > 51200:
+        print(f"WARNING: {size} bytes exceeds the 51200-byte direct create-stack limit;"
               " use --template-url with S3, or trim.")
 
 
