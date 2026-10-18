@@ -133,7 +133,7 @@ idle shutdown, the waker, the secret — is shared.
 | | `geopose` (default) | `spatialdds` |
 |---|---|---|
 | Upstream | `openvps:main` | `openvps:spatialdds` |
-| Protocol | OSCP GeoPose Protocol over HTTP | SpatialDDS 1.7 VPS binding over DDS, plus the HTTP endpoint |
+| Protocol | OSCP GeoPose Protocol over HTTP | SpatialDDS 1.8 VPS binding over DDS, plus the HTTP endpoint |
 | Extra ports | — | 8088 from the waker; RTPS 7400–7500 between hosts in the group |
 
 ```sh
@@ -144,6 +144,20 @@ aws cloudformation create-stack --stack-name openvps-spatialdds \
                ParameterKey=VpcId,ParameterValue=vpc-xxxx \
                ...
 ```
+
+### Why the two halves are on different eras
+
+The localizer publishes SpatialDDS 1.8. The web bridge still builds against the vendored
+1.7 tree, and that is deliberate rather than drift: the bridge needs `oarc_demo` from it, a
+demo-local module with no 1.8 version by design, so moving it would fork three vendored
+helpers upstream for no behavioural gain.
+
+They interoperate because every type on these lanes is `@extensibility(APPENDABLE)` and
+`FrameRef` grew from four members to eight by appending.
+`maplocalizer/server/tests/test_cross_era_interop.py` proves it rather than assuming it —
+it stands the two eras up on separate participants and asserts a 1.7 request still returns
+a pose. That same property is what keeps an already-deployed 1.7 AR client working against
+this service, which is the reason it is tested rather than reasoned about.
 
 Both variants pin an explicit commit, in the `VariantConfig` mapping in
 `template.src.yaml`. Neither tracks a branch: a branch would let two deployments of the

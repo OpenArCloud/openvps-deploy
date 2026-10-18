@@ -30,7 +30,7 @@ Parameters:
     AllowedValues: [geopose, spatialdds]
     Description: >-
       `geopose` is the GeoPose Protocol service on openvps:main, and is what this template
-      deployed before the variant existed. `spatialdds` is the SpatialDDS 1.7 VPS binding
+      deployed before the variant existed. `spatialdds` is the SpatialDDS 1.8 VPS binding
       on the openvps:spatialdds branch. The variant selects the upstream ref and the
       Compose overrides; sizing, storage, idle shutdown and the waker are shared. See the
       VariantConfig mapping — neither variant tracks a moving branch.
@@ -185,15 +185,18 @@ Mappings:
       IdleExtraPorts: ''
       IdleExtraContainers: ''
     spatialdds:
-      # openvps:spatialdds. The branch is now main plus the SpatialDDS 1.7 VPS binding: the
+      # openvps:spatialdds. The branch is now main plus the SpatialDDS 1.8 VPS binding: the
       # localizer joins DDS, serves vps_query/vps_response and announces itself, and the web
-      # bridge carries the same types to browsers. It is a fast-forward of main, so it
+      # bridge carries those lanes to browsers. It is a fast-forward of main, so it
       # includes the DEFAULT_* removal and neither variant reads those variables any more.
+      #
+      # Localizer 1.8, bridge still 1.7: deliberate, not drift. See README, "Why the two
+      # halves are on different eras".
       #
       # This ref is what the instance clones, so it has to exist on GitHub. The branch and
       # this pin move together in one commit: a pin naming an unpushed commit fails at
       # checkout, and a pin left behind silently deploys code the branch has moved past.
-      UpstreamRef: 31b3df8ce23dc367e7e42a8bfd90cf969e87ea60
+      UpstreamRef: a5b2b1d41b0191065badc213de23af6bc5c1b2e7
       ComposeFiles: '-f docker-compose.yaml -f /opt/openvps/docker-compose.aws.yaml -f /opt/openvps/docker-compose.spatialdds.yaml'
       # The web bridge's WebSocket port, so a connected browser client counts as activity.
       IdleExtraPorts: '8088'
