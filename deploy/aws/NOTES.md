@@ -1472,3 +1472,97 @@ this.
 Instance **stopped** 2026-10-19 after the deploy; compute billing ended, EBS
 continues. Two redundant artefacts left for a deliberate decision rather than
 deleted: `vol-001bd9ee9a748b8c8` (~$4/mo) and `snap-0fc4bee6183dc1666`.
+
+### Phase 3: the demo against this deployment (2026-10-19)
+
+The AR demo cloned at SpatialDDS-demo `f3e11d2`, run beside OpenVPS on the
+instance, with the page itself served locally and reaching the bridge and
+binding over two SSM port forwards.
+
+**The quartet's value is no longer owed, and the expectation above was
+wrong.** Measured off the wire from a 1.8 observer, both eras, with
+`deploy/aws/testing/dds-vs-http-geopose.py`:
+
+| client | HTTP vs DDS | `frame_ref` | scale quartet |
+|---|---|---|---|
+| 1.8 | 0.013 cm mean | 8 members | `has_scale=True` `SCALE_DERIVED` `0.9999999998790815` `'m'` |
+| 1.7 | 0.015 cm mean (max 0.025) | 4 members | truncated away |
+
+So the same pose to sub-millimetre across the era boundary, and the 1.7 reader
+cannot see what 1.8 appended — the designed behaviour, and the reason the
+demo's 1.7 bridge can talk to a 1.8 service at all.
+
+The `≈0.24 m/unit` in the "Still owed" note above is **this map's
+predecessor**. 0.2417 is the scale `hlocMapScaleEstimation` derived for the
+`b2dff1f` test map; `b1afa008` reconstructs metric, so its `meters_per_unit`
+is ≈1.0. The figure was carried forward as an expectation without re-deriving
+it for the new map, which is the same stale assumption as the "a map is never
+metric" line still sitting in the census — post-`b2dff1f` maps *are* metric
+and this one is the counterexample. Both want correcting where they are
+written rather than remembered.
+
+### Filing for the OpenVPS agent: `localization-eval.py` reads a rotation as a scale
+
+`openvps-directions/testing-backup/localization-eval.py` loads the 4×4
+homogeneous `transform.json` matrix and then uses `M[0][0]` as the metric
+scale — three times, at lines 26, 87 and 90:
+
+```python
+M = np.array(XF["matrix"], dtype=float)
+...
+print(f"transform: ... scale = {M[0][0]:.6f}")
+print(f"   error : {err*1000:.2f} mm  ({err*M[0][0]*100:.2f} cm metric, ...)")
+```
+
+`M[0][0]` is one element of the combined rotation-and-scale block, so it is
+`scale · R[0][0]` and equals the scale only when there is no rotation about Y
+or Z. The scale is the norm of a column of the 3×3 block (or the cube root of
+its determinant). Every "cm metric" figure the script reports is therefore off
+by `R[0][0]`, understating the error — measured at about 2% on `b1afa008`
+during this deployment.
+
+Not fixed here: `openvps` is read-only in this work, and the script lives in
+the directions tree. It matters because the numbers it prints are the ones
+quoted as this deployment's accuracy.
+
+### Three mechanical traps, for whoever deploys the demo next
+
+**The harness's `SERVER` path.** `dds-vs-http-geopose.py` points at
+`/opt/openvps/maplocalizer/server`, which is right when it runs in the
+OpenVPS container and wrong when it runs in the demo's — there it is
+`/app/server`. Worth a flag rather than an edit-on-the-instance.
+
+**Ownership.** The clone on the instance is made by root over SSM; the demo's
+container runs as uid 1000 and cannot create its own log directory, failing
+with `Permission denied` on `/app/bridges/web_bridge/logs`. `chown -R
+1000:1000` on the clone fixes it. Easy to mistake for a build problem.
+
+**Host networking.** The demo and OpenVPS must find each other over unicast
+DDS on the same box, so the demo's container needs `--network host`, and
+`run_bridge_server_docker.sh` has no flag for it. Getting it up took an
+instance-local `sed` — recorded in SpatialDDS-demo `docs/remote-stack-finding.md`
+along with the two ways an SSM port forward dies and why a dropped tunnel
+looks like a working demo.
+
+### The deployed acceptance, shown able to fail
+
+A green run against a real service proves nothing unless the check can report
+red, so each claim was re-run against a subject it must reject:
+
+| claim | attack | result |
+|---|---|---|
+| the pose is computed from the query image | an off-map image with hundreds of real corners | `VPS_FAILED` |
+| …and the service is not merely broken | the on-map frame again, after | `VPS_SUCCESS` |
+| discovery reads identity, not position | a service id never announced | absent |
+| a 404 cannot read as "no service" | HTTP status asserted before parsing | 200 |
+
+The last row is there because the first draft of that check asked for
+`/v1/search`, which does not exist — the route is
+`/.well-known/spatialdds/search` — and `.get("results", [])` turned the 404
+into "zero services announced". A missing route and an empty registry were
+indistinguishable, and an instrument defect was one step from being reported
+as a deployment defect.
+
+Stopping the service to prove the same thing was deliberately **not** used: a
+stopped server shows only that a check notices an absent peer, whereas an
+off-map frame shows the pose is computed from the pixels.
