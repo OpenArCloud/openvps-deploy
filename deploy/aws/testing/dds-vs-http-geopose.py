@@ -76,19 +76,38 @@ def _import_era(era: str):
     from spatialdds_demo import blob as blobmod                # noqa: E402
     from spatialdds_demo import typed_transport as tt          # noqa: E402
 
+    #: **Every type in the request must come from the era's own tree.**
+    #: `spatialdds/service.py` is bound to 1.8, so its `_empty_geopose()` and
+    #: `now_time()` helpers return 1.8 objects — borrowing them for a 1.7
+    #: request puts a 1.8 `GeoPose` inside it and `write()` fails with
+    #: `DDS_RETCODE_BAD_PARAMETER`, which names nothing useful. Measured on the
+    #: deployed stack 2026-10-19, after the 1.8 run passed: the leak is
+    #: invisible until the *other* era runs, because on 1.8 the borrowed
+    #: helpers happen to be right. Build them here instead.
     if era == "1.8":
         from spatialdds_idl18.spatial.argeo import (            # noqa: E402
             QualityRequirements, VpsRequest, VpsResponse)
         from spatialdds_idl18.spatial.common import FrameRef, ScaleStatus
-        from spatialdds_idl18.spatial.core import BlobChunk, BlobRef
+        # GeoPose and CovMatrix from `core`, which *defines* them. `argeo`
+        # re-exports GeoPose as an annotated alias that reports zero members
+        # and raises `TypeError: 'ForwardRef' object is not callable` when
+        # called. Measured here on 2026-10-19 — the third time this trap has
+        # cost something in this programme, and the first time after it was
+        # written down. Resolve at the definition, never the re-export.
+        from spatialdds_idl18.spatial.core import (
+            BlobChunk, BlobRef, CovMatrix, GeoPose)
+        from spatialdds_idl18.builtin import Time
     else:
         from spatialdds_idl.spatial.argeo import (              # noqa: E402
             QualityRequirements, VpsRequest, VpsResponse)
         from spatialdds_idl.spatial.common import FrameRef
-        from spatialdds_idl.spatial.core import BlobChunk, BlobRef
+        from spatialdds_idl.spatial.core import (
+            BlobChunk, BlobRef, CovMatrix, GeoPose)
+        from spatialdds_idl.builtin import Time
         ScaleStatus = None
     return svc, blobmod, tt, (VpsRequest, VpsResponse, QualityRequirements,
-                              FrameRef, ScaleStatus, BlobChunk, BlobRef)
+                              FrameRef, ScaleStatus, BlobChunk, BlobRef,
+                              GeoPose, CovMatrix, Time)
 
 
 def _client_frame(FrameRef, ScaleStatus):
@@ -182,7 +201,17 @@ def main() -> int:
 
     svc, blobmod, tt, types = _import_era(args.era)
     (VpsRequest, VpsResponse, QualityRequirements,
-     FrameRef, ScaleStatus, BlobChunk, BlobRef) = types
+     FrameRef, ScaleStatus, BlobChunk, BlobRef,
+     GeoPose, CovMatrix, Time) = types
+
+    def _now():
+        t = time.time()
+        return Time(sec=int(t), nanosec=int((t % 1) * 1e9))
+
+    def _blank_geopose():
+        return GeoPose(lat_deg=0.0, lon_deg=0.0, alt_m=0.0,
+                       q=[0.0, 0.0, 0.0, 1.0], stamp=_now(),
+                       cov=CovMatrix(none=0))
 
     root = f"/uploads/{args.dataset}"
     rec = pycolmap.Reconstruction(
@@ -211,13 +240,13 @@ def main() -> int:
         request = VpsRequest(
             query_id=qid, service_id=args.service_id,
             client_frame_ref=_client_frame(FrameRef, ScaleStatus),
-            has_prior_geopose=False, prior_geopose=svc._empty_geopose(),
+            has_prior_geopose=False, prior_geopose=_blank_geopose(),
             query_blobs=[BlobRef(blob_id=ref["blob_id"], role=ref["role"],
                                  checksum=ref["checksum"])],
             query_stream_id="", has_quality_requirements=False,
             quality_requirements=QualityRequirements(max_rmse_m=0.0,
                                                      min_confidence=0.0),
-            stamp=svc.now_time())
+            stamp=_now())
         t0 = time.time()
         req_w.write(request)
         for c in blobmod.chunk(blob_id, image, cls=BlobChunk):
