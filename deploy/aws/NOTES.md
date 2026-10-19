@@ -1391,3 +1391,84 @@ the map, so this is self-consistency rather than generalisation.
 **When bumping the pin, re-derive `nginx/mapbuilder.conf`.** It is copied into the frontend
 image at build time and we mount a modified copy over it, so it is the one file that drifts
 silently.
+
+## Deployed the 1.8 binding: `openvps-fountain-3` (2026-10-19)
+
+First deployment of the migrated binding. `openvps-fountain-2` was still on
+`31b3df8` — pre-migration 1.7 — because the clone happens once on first boot
+and user-data does not re-run, so bumping the pin moves nothing on an existing
+instance. A new stack was the only honest route; the old one is untouched.
+
+| | |
+|---|---|
+| stack | `openvps-fountain-3`, CREATE_COMPLETE in 38.5 min |
+| `UpstreamRefDeployed` | `a5b2b1d41b0191065badc213de23af6bc5c1b2e7` |
+| instance | `i-0026bccc7a4f83a15`, `g4dn.2xlarge`, private `172.31.0.180`, us-east-1a |
+| maps volume | `vol-017539e961d1cb0c0` (the stack's own, 50 GB) |
+| snapshot of fountain-2's maps | `snap-0fc4bee6183dc1666` |
+| restore volume (now redundant) | `vol-001bd9ee9a748b8c8`, attached `/dev/sdg`, mounted `/mnt/restore` |
+
+All seven containers healthy; `maplocalizer /health` and
+`webbridge /.well-known/spatialdds/bootstrap` both 200.
+
+### The map restore avoided stop/detach
+
+The template has no `SnapshotId` parameter, so a new stack always gets an empty
+maps volume and the README's restore wants stop → detach → attach → start.
+Done differently here: snapshot, `create-volume` from it in the same AZ,
+`attach-volume` as a **second** device, then `rsync /mnt/restore/maps/ ->
+/home/ubuntu/data/maps/`. The stack's own volume stays the one user-data
+mounts by UUID, nothing was detached, and the restore volume is now redundant.
+331 MB restored; ids match the August record — dataset
+`e6c9dced-7c03-494a-8ac0-581da857c13c`, map
+`b1afa008-6c71-4877-b831-70b113d601dc` (the 269/269 build).
+
+`GET /load_map/b1afa008-…` returned *"Successfully loaded map"*. Note for
+resume: **the loaded-map pool is in memory**, so this call has to be repeated
+after every instance start before the service will announce.
+
+### The announce, and what a 1.7 consumer sees of it
+
+Live and derived from real map data, read through the web bridge's
+`search?kind=VPS`:
+
+```
+service_id  svc:vps:oarc/aws-test;v=b1afa008-6c71-4877-b831-70b113d601dc
+kind        VPS          version 1.8
+caps        preferred_profiles: spatial.core/1.8, spatial.argeo/1.8
+coverage    EPSG:4326 bbox  lon -97.73996..-97.73938  lat 30.28360..30.28393
+transform   openvps/hloc/b1afa008-…/colmap_world -> earth-fixed, coord_convention CV
+```
+
+**The map frame's scale quartet is carried and the 1.7 bridge truncates it.**
+The transform's `from` frame came back with four members and no scale. That is
+the era boundary, not a defect, and both halves are evidenced:
+`_map_to_enu_transform_entry` sets `has_scale`, `scale_status`,
+`meters_per_unit` and `display_unit` (read in `announce.py`), while the view
+above is served by the **1.7** bridge — `profile: spatial.manifest/1.7` — and
+`FrameRef` grew 4→8 by appending, so a 1.7 reader sees exactly the first four.
+The legacy `openvps.coord_scale_m_per_unit` hint is absent from that
+projection too.
+
+Still owed: the quartet's *value* off the wire from a 1.8 observer
+(expected `SCALE_DERIVED`, ≈0.24 m/unit). The observer is written; running it
+needs a process inside the container.
+
+### Resuming
+
+```sh
+aws ec2 start-instances --region us-east-1 --instance-ids i-0026bccc7a4f83a15
+# wait for docker, then re-load the map (in-memory pool, see above)
+aws ssm send-command --region us-east-1 --instance-ids i-0026bccc7a4f83a15 \
+  --document-name AWS-RunShellScript \
+  --parameters 'commands=["curl -s -m 600 http://127.0.0.1:8000/load_map/b1afa008-6c71-4877-b831-70b113d601dc"]'
+```
+
+Then Phase 3: the demo beside it with `SPATIALDDS_DDS_DOMAIN=0`,
+`SPATIALDDS_DDS_CONFIG=.../cyclonedds-colocated.xml` and
+`SPATIALDDS_MOCK_VPS=0` — all three landed in SpatialDDS-demo `f3e11d2` for
+this.
+
+Instance **stopped** 2026-10-19 after the deploy; compute billing ended, EBS
+continues. Two redundant artefacts left for a deliberate decision rather than
+deleted: `vol-001bd9ee9a748b8c8` (~$4/mo) and `snap-0fc4bee6183dc1666`.
